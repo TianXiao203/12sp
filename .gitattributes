@@ -1,0 +1,20 @@
+# 强制 LF：脚本/工作流/配置如果带上 CRLF，在 Linux runner 上执行会出各种诡异错误
+# （例如 `set -euo pipefail` 变成非法选项、变量值末尾多一个 \r 导致比较失败）
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.config    text eol=lf
+*.fragment  text eol=lf
+*.patch     text eol=lf
+*.txt       text eol=lf
+*.md        text eol=lf
+
+# 二进制文件不做换行转换
+*.png       binary
+*.jpg       binary
+*.zip       binary
+*.gz        binary
+*.img       binary
