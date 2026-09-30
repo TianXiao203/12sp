@@ -125,21 +125,41 @@ if [ -f "$BCC" ] && [ -x "$CLANG_DIR/bin/clang" ]; then
   fi
 fi
 
-if [ ! -d "$WS/build/.git" ]; then
-  log "clone AOSP kernel/build ..."
-  git clone --depth=1 https://android.googlesource.com/kernel/build "$WS/build" \
-    || git clone --depth=1 https://github.com/aosp-mirror/kernel_build "$WS/build" \
-    || warn "build 仓库 clone 失败"
+if [ ! -f "$WS/build/build.sh" ]; then
+  rm -rf "$WS/build"
+  log "获取 build/（AOSP kernel/build 的 build.sh）"
+  # 源 1：AOSP googlesource（权威）
+  git clone --depth=1 https://android.googlesource.com/kernel/build "$WS/build" 2>/dev/null || true
+  # 源 2：GitHub 托管的镜像（已验证含 build.sh / build-tools / android / envsetup.sh）
+  if [ ! -f "$WS/build/build.sh" ]; then
+    rm -rf "$WS/build"
+    warn "googlesource 获取失败，改用 GitHub 镜像 xiaomi-sm8450-kernel/android_kernel_platform_build"
+    git clone --depth=1 https://github.com/xiaomi-sm8450-kernel/android_kernel_platform_build "$WS/build" 2>/dev/null || true
+    if [ ! -f "$WS/build/build.sh" ]; then
+      rm -rf "$WS/build"
+      git clone --depth=1 -b kernel.lnx.5.10.r1-rel \
+        https://github.com/xiaomi-sm8450-kernel/android_kernel_platform_build "$WS/build" 2>/dev/null || true
+    fi
+  fi
+  if [ -f "$WS/build/build.sh" ]; then
+    echo "[assemble][OK] build/build.sh 就绪"
+  else
+    warn "build/ 获取失败 —— 编译需要一个提供 build/build.sh 的仓库"
+  fi
 fi
 
 if [ ! -d "$WS/external/dtc" ]; then
-  log "clone external/dtc ..."
-  git clone --depth=1 https://android.googlesource.com/platform/external/dtc "$WS/external/dtc" \
-    || {
-      warn "external/dtc 拉取失败，改用系统 dtc 打桩（需要 apt install device-tree-compiler）"
-      mkdir -p "$WS/external/dtc"
-      cat > "$WS/external/dtc/Makefile" <<'EOF'
-# 打桩 Makefile：把系统 dtc 安装到 PREFIX/bin
+  log "获取 external/dtc ..."
+  git clone --depth=1 https://android.googlesource.com/platform/external/dtc "$WS/external/dtc" 2>/dev/null \
+    || git clone --depth=1 https://git.codelinaro.org/clo/la/kernel_platform/external/dtc "$WS/external/dtc" 2>/dev/null \
+    || true
+  if [ ! -f "$WS/external/dtc/Makefile" ]; then
+    warn "external/dtc 拉取失败，改用系统 dtc 打桩（依赖 apt 的 device-tree-compiler）"
+    rm -rf "$WS/external/dtc"
+    mkdir -p "$WS/external/dtc"
+    cat > "$WS/external/dtc/Makefile" <<'EOF'
+# 打桩 Makefile：把系统 dtc 安装到 PREFIX/bin，满足 build.config.msm.common 的
+# compile_external_dtc()（它会执行 make all install PREFIX=${COMMON_OUT_DIR}/host）
 all:
 	@command -v dtc >/dev/null 2>&1 || { echo "需要 dtc，请 apt install device-tree-compiler"; exit 1; }
 install: all
@@ -147,7 +167,8 @@ install: all
 	@cp -f "$$(command -v dtc)" $(PREFIX)/bin/dtc
 	@echo "installed stub dtc -> $(PREFIX)/bin/dtc"
 EOF
-    }
+    echo "[assemble] 已写入 dtc 打桩 Makefile"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -181,7 +202,11 @@ fi
 # ---------------------------------------------------------------------------
 cat > "$WS/build.env" <<EOF
 export ROOT_DIR="$WS"
-export KERNEL_DIR="$WS/common"
+# KERNEL_DIR 必须是【相对】ROOT_DIR 的路径！
+# build.sh 内部会做 cd \${ROOT_DIR}/\${KERNEL_DIR}，
+# 若传绝对路径会拼成 \$WS//home/... 而失败。
+# 默认值就是 "common"，正好对应我们的布局（内核树放在 \$WS/common）。
+export KERNEL_DIR="common"
 export BUILD_CONFIG="common/build.config.msm.waipio"
 export VARIANT="gki"
 export LTO="thin"
@@ -209,9 +234,18 @@ chk "build/build.sh"      "$WS/build/build.sh"
 chk "clang"               "$CLANG_DIR/bin/clang"
 chk "external/dtc"        "$WS/external/dtc/Makefile"
 
+# 外部模块只是附带产物：我们的交付物是内核 Image（AK3 只换 Image），
+# 所以 EXT_MODULES 缺失只告警、不阻断（否则会白白浪费一次构建）。
+MISS_EXT=0
 for k in mmrm-driver audio-kernel camera-kernel display-drivers video-driver; do
-  [ -e "$WS/modules/qcom/opensource/$k" ] || { printf '  [MISS] %-46s %s\n' "EXT_MODULE $k" "$WS/modules/qcom/opensource/$k"; FAIL=$((FAIL+1)); }
+  if [ -e "$WS/modules/qcom/opensource/$k" ]; then
+    printf '  [OK]   %-46s %s\n' "EXT_MODULE $k" "$WS/modules/qcom/opensource/$k"
+  else
+    printf '  [WARN] %-46s 缺失（不影响编出 Image）\n' "EXT_MODULE $k"
+    MISS_EXT=$((MISS_EXT+1))
+  fi
 done
+[ "$MISS_EXT" -ne 0 ] && warn "有 $MISS_EXT 个外部模块源缺失：Image 仍可编译，但 vendor_dlkm.img 会不完整（本方案用不到）"
 
 echo "================================================"
 if [ "$FAIL" -ne 0 ]; then

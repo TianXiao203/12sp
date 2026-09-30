@@ -109,18 +109,29 @@ jobs:
       - name: Checkout build kit
         uses: actions/checkout@v4
 
-      - name: 释放磁盘空间并增加 swap（内核树 + clang 很大）
+      - name: 释放磁盘空间并尝试增加 swap（纯优化，任何子步骤失败都不中断）
         run: |
-          set -e
-          echo "== 释放前 =="; df -h /
+          # 注意：这一步只是压缩耗时/加内存兜底，绝不能让它把整个构建搞挂。
+          # 所以这里【不加 set -e】，每条命令都容错。
+          echo "== 释放前 =="; df -h / 2>/dev/null || true
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                      /usr/share/swift /usr/lib/jvm /usr/local/.ghcup
-          sudo apt-get clean
-          echo "== 释放后 =="; df -h /
-          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
-          sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-          free -h
+                      /usr/share/swift /usr/lib/jvm /usr/local/.ghcup \
+                      2>/dev/null || echo "[WARN] 删除部分目录失败，忽略"
+          sudo apt-get clean 2>/dev/null || true
+          echo "== 释放后 =="; df -h / 2>/dev/null || true
+
+          # swap 只是内存兜底；GitHub runner 上 swapon 有时会被拒，失败也必须继续
+          if [ ! -f /swapfile ]; then
+            sudo fallocate -l 8G /swapfile 2>/dev/null \
+              || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 2>/dev/null \
+              || echo "[WARN] 创建 swapfile 失败，忽略"
+          fi
+          sudo chmod 600 /swapfile 2>/dev/null || true
+          sudo mkswap /swapfile >/dev/null 2>&1 || echo "[WARN] mkswap 失败，忽略"
+          sudo swapon /swapfile 2>&1 || echo "[WARN] swapon 被拒，忽略（无 swap 也能编，只是并行度要保守）"
+          free -h 2>/dev/null || true
+          echo "[OK] 准备步骤结束"
 
       - name: 安装构建依赖
         run: |
