@@ -13,6 +13,19 @@
 ##   BOARD_KERNEL_IMAGE_NAME := Image
 ##   BOARD_INCLUDE_DTB_IN_BOOTIMG := true
 ##   -> 交给 AnyKernel3 的 magiskboot 处理即可，不要手工按 header v3 拼包。
+##
+## ⚠️⚠️ 下面的变量【必须大写】—— BLOCK / IS_SLOT_DEVICE / RAMDISK_COMPRESSION /
+##      PATCH_VBMETA_FLAG。ak3-core.sh 读的就是这几个大写变量。
+##
+##      旧版 ak3-core.sh 里有一层小写兼容：
+##          [ "$block" ] && BLOCK="$block";
+##          [ "$is_slot_device" ] && IS_SLOT_DEVICE="$is_slot_device";
+##      但 AK3 现行版本（本工程 clone 的 HEAD）已经把这层删掉了。
+##      只写小写会让 BLOCK 变成空值，于是走 case $BLOCK 的 * 分支、
+##      parttype 为空、循环一次都不执行，最后报：
+##          Unable to determine  partition. Aborting...
+##      —— 注意 "determine" 和 "partition" 之间是【两个空格】，就是 $BLOCK 为空。
+##      2026-10-01 实际踩过这个坑（见 .workbuddy/memory 当日日志）。
 
 properties() { '
 kernel.string=Unicorn 5.10 GKI + ReSukiSU + Docker cgroups
@@ -31,11 +44,11 @@ supported.patchlevels=
 supported.vendorpatchlevels=
 '; } # end properties
 
-# shell variables
-block=boot
-is_slot_device=auto
-ramdisk_compression=auto
-patch_vbmeta_flag=auto
+# boot shell variables（必须大写，见上面的警告）
+BLOCK=boot
+IS_SLOT_DEVICE=auto
+RAMDISK_COMPRESSION=auto
+PATCH_VBMETA_FLAG=auto
 
 ## AnyKernel 内部方法（请勿修改）
 . tools/ak3-core.sh;

@@ -82,6 +82,11 @@ rm -rf "$AK3_DIR/modules" "$AK3_DIR/ramdisk" "$AK3_DIR/split_img" "$AK3_DIR/rdtm
 cp -f "$IMAGE" "$AK3_DIR/Image" || { err "复制 Image 到 $AK3_DIR 失败"; exit 1; }
 
 # --- 4) anykernel.sh：优先仓库版本，缺失则内嵌兜底 ---------------------------
+# 先删掉任何大小写变体：AK3 backend（META-INF/.../update-binary）里写死的是小写
+# `anykernel.sh`（`ash anykernel.sh` 就是入口），而 clone 下来的目录/某些
+# 大小写不敏感的文件系统上可能残留 `Anykernel.sh`，两者同时存在会很难查。
+rm -f "$AK3_DIR"/anykernel.sh "$AK3_DIR"/Anykernel.sh "$AK3_DIR"/ANYKERNEL.SH
+
 AK3_SH_REPO="$HERE/anykernel3/anykernel.sh"
 if [ -f "$AK3_SH_REPO" ]; then
   cp -f "$AK3_SH_REPO" "$AK3_DIR/anykernel.sh" || { err "复制 $AK3_SH_REPO 失败"; exit 1; }
@@ -91,6 +96,10 @@ else
   cat > "$AK3_DIR/anykernel.sh" <<'AK3EOF'
 ### AnyKernel3 Ramdisk Mod Script (内嵌兜底版本)
 ## 只替换 kernel Image，保留原机 DTB 与 ramdisk。
+##
+## 变量必须【大写】：ak3-core.sh 读的是 $BLOCK / $IS_SLOT_DEVICE 等；
+## 现行 AK3 已删掉 `[ "$block" ] && BLOCK="$block"` 那层小写兼容，
+## 写小写会让 BLOCK 为空，报 "Unable to determine  partition"（两个空格）。
 
 properties() { '
 kernel.string=Unicorn 5.10 GKI + ReSukiSU + Docker cgroups
@@ -109,10 +118,10 @@ supported.patchlevels=
 supported.vendorpatchlevels=
 '; } # end properties
 
-block=boot
-is_slot_device=auto
-ramdisk_compression=auto
-patch_vbmeta_flag=auto
+BLOCK=boot
+IS_SLOT_DEVICE=auto
+RAMDISK_COMPRESSION=auto
+PATCH_VBMETA_FLAG=auto
 
 . tools/ak3-core.sh;
 
@@ -121,7 +130,28 @@ write_boot;
 ## end install
 AK3EOF
 fi
-[ -s "$AK3_DIR/anykernel.sh" ] || { err "$AK3_DIR/anykernel.sh 为空"; exit 1; }
+if [ ! -s "$AK3_DIR/anykernel.sh" ]; then
+  err "$AK3_DIR/anykernel.sh 不存在或为空"
+  exit 1
+fi
+# 自检：确认就是小写这一个名字，且变量是大写（否则刷机会在分区判定处失败）
+# 注意：不能用 [ -e "$AK3_DIR/Anykernel.sh" ] —— 在 Windows 这类大小写不敏感
+#       的文件系统上它会解析到 anykernel.sh，造成误报。这里用 ls 列出真实名字再比对。
+AK3_VARIANTS="$(ls -1 "$AK3_DIR" 2>/dev/null | grep -iE '^anykernel\.sh$' | grep -vx 'anykernel.sh' || true)"
+if [ -n "$AK3_VARIANTS" ]; then
+  err "$AK3_DIR 里存在大小写不一致的脚本名（真实名字：$AK3_VARIANTS），会导致行为不一致"
+  exit 1
+fi
+if ! ls -1 "$AK3_DIR" 2>/dev/null | grep -qx 'anykernel.sh'; then
+  err "$AK3_DIR 里没有规范的小写 anykernel.sh（AK3 backend 执行的就是这个名字）"
+  exit 1
+fi
+if ! grep -qE '^BLOCK=' "$AK3_DIR/anykernel.sh"; then
+  err "anykernel.sh 里没有大写的 BLOCK= —— 现行 ak3-core.sh 只认大写，写小写会在刷机时报 'Unable to determine  partition'"
+  grep -nE '^(block|BLOCK|is_slot_device|IS_SLOT_DEVICE)=' "$AK3_DIR/anykernel.sh" | while IFS= read -r l; do err "$l"; done
+  exit 1
+fi
+log "[+] anykernel.sh 自检通过（小写文件名 + 大写变量）"
 
 # --- 5) 打包 -----------------------------------------------------------------
 if ! command -v zip >/dev/null 2>&1; then

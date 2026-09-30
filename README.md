@@ -639,7 +639,8 @@ scripts/integrate-resukisu.sh              集成 ReSukiSU + 校验软链/Makefi
 scripts/lineage-tree-build.sh              路径 A：LineageOS 树里一键打配置+集成+m bootimage
 scripts/assemble-lineage-kernel.sh         路径 B：组装编译工作区（含 commit 钉住 + 路径自检）
 scripts/verify-built-config.sh             编译后核对 .config 并比对 kernelrelease
-scripts/pack-anykernel3.sh                 生成只换 kernel 的 AnyKernel3 包
+scripts/pack-anykernel3.sh                 生成只换 kernel 的 AnyKernel3 包（含 anykernel.sh 自检）
+scripts/patch-ak3-zip.py                   就地替换已有 AK3 zip 里的 anykernel.sh（免重编）
 scripts/device-verify.sh                   手机上一键验证（只读）
 anykernel3/anykernel.sh                    AnyKernel3 配置（device.name1=unicorn）
 .github/workflows/build-unicorn-kernel.yml GitHub Actions 构建工作流
@@ -666,3 +667,5 @@ anykernel3/anykernel.sh                    AnyKernel3 配置（device.name1=unic
 | 编出来是 `5.10.260-gki-gef362912d37b-dirty` | 工作树有未提交改动，`setlocalversion` 追加了 `-dirty` | 已在 `assemble` 里写 `.scmversion` 冻结（见 5.0）；若仍出现，检查 `$WS/common/.scmversion` 是否存在 |
 | CI 上 `cp: cannot stat '.../anykernel3/anykernel.sh'`，步骤 1 秒失败且无报错 | 该文件被 `.gitignore` 的大小写冲突漏掉，从未入库 | `git check-ignore -v <文件>` 验证；**Windows 上绝不能写大小写只差的名字**（如 `AnyKernel3/` 会连 `anykernel3/` 一起忽略）。工作流第 2 步「预检」现在会提前拦下 |
 | 想知道 CI 到底报了什么，但 job log 要 admin 权限 | job log 接口匿名是 `403`，artifact 匿名是 `401` | 看 `ci-diag` 分支（失败时自动推送，含完整 `build.log`），或看 run 页面的 Annotations（`::error::` 匿名可读） |
+| 刷机报 `Unable to determine  partition. Aborting...`（**注意 `determine` 和 `partition` 之间是两个空格**） | `anykernel.sh` 用了**小写**的 `block=boot`。现行 `ak3-core.sh` 只读大写 `$BLOCK`；旧版 core 里有 `[ "$block" ] && BLOCK="$block"` 的小写兼容层，而 AK3 HEAD（本工程 clone 的版本）**已经删掉**了这层 → `BLOCK` 为空 → 走 `case $BLOCK` 的 `*` 分支、`parttype` 为空、循环一次都不执行 → 报错里出现两个空格 | 四个变量必须**大写**：`BLOCK=` / `IS_SLOT_DEVICE=` / `RAMDISK_COMPRESSION=` / `PATCH_VBMETA_FLAG=`。`pack-anykernel3.sh` 现在会在打包时自检并拒绝小写写法 |
+| 已经刷机失败，但内核 Image 是好的，不想再等 16 分钟重编 | 只有一个文本文件 `anykernel.sh` 需要换 | 用 `python scripts/patch-ak3-zip.py <原zip> anykernel3/anykernel.sh [输出zip]` 就地替换，只改这一个文件、其余（含 `Image`）原样保留 |
