@@ -82,9 +82,9 @@ on:
           - 'true'
           - 'false'
       free_disk:
-        description: '清理 runner 预装 SDK 腾磁盘（构建含 clone 约需 30GB；runner 默认只有 ~14GB 空闲，关掉很可能 No space left）'
+        description: '清理 runner 预装 SDK 腾磁盘。源码默认放 /mnt（约 70GB 空闲），所以默认不需要清理；只有改用 / 时才建议开'
         required: true
-        default: 'true'
+        default: 'false'
         type: choice
         options:
           - 'true'
@@ -108,7 +108,9 @@ jobs:
     timeout-minutes: 360
 
     env:
-      WS: ${{ github.workspace }}/kp
+      # 注意：WS 不在这里写死，由第一步「选择构建工作区」动态决定（优先 /mnt，
+      # 那里默认有 ~74GB 空闲，而 / 只剩 ~14GB）。写在 job env 里会覆盖 GITHUB_ENV，
+      # 所以必须留空。
       IN_BRANCH: ${{ inputs.lineage_branch }}
       IN_COMMIT: ${{ inputs.kernel_commit }}
       IN_CLANG: ${{ inputs.clang_version }}
@@ -127,33 +129,66 @@ jobs:
       - name: Checkout build kit
         uses: actions/checkout@v4
 
+      - name: 选择构建工作区（优先 /mnt，空间最大，因此无需清理系统目录）
+        id: pick_ws
+        run: |
+          set -e
+          echo "== 各挂载点可用空间 =="
+          df -h / /mnt /home/runner /tmp 2>/dev/null || true
+          echo
+          # GitHub 托管 runner 上 /dev/root 只有 ~14GB 空闲，而 /mnt 通常有 ~70GB。
+          # 把 10GB 级的内核源码 + clang + 编译产物全放 /mnt，就不需要删除
+          # runner 预装的 Android SDK / dotnet 之类（用户明确要求不要动它们）。
+          BEST=""
+          BEST_FREE=0
+          for d in /mnt /home/runner /tmp /; do
+            [ -d "$d" ] || continue
+            [ -w "$d" ] || continue
+            FREE_MB=$(df -Pm "$d" 2>/dev/null | awk 'NR==2{print $4}')
+            [ -n "$FREE_MB" ] || continue
+            echo "  候选 $d -> 可用 ${FREE_MB} MB"
+            if [ "$FREE_MB" -gt "$BEST_FREE" ]; then BEST="$d"; BEST_FREE="$FREE_MB"; fi
+          done
+          if [ -z "$BEST" ]; then BEST="/mnt"; fi
+          WS="${BEST%/}/kp"
+          echo "WS=$WS" >> "$GITHUB_ENV"
+          # 同时输出到 step output：${{ env.* }} 取不到 GITHUB_ENV 的值，
+          # 而 actions/cache 的 path 只能用表达式，所以这里必须显式输出。
+          echo "ws=$WS" >> "$GITHUB_OUTPUT"
+          echo "::notice title=构建工作区:: $WS (可用约 $((BEST_FREE/1024)) GB)"
+          mkdir -p "$WS"
+          echo "== 选定后的空间 =="
+          df -h "$WS"
+
       - name: 释放磁盘空间并尝试增加 swap（纯优化，任何子步骤失败都不中断）
         run: |
-          # 注意：这一步只是压缩耗时/加内存兜底，绝不能让它把整个构建搞挂。
-          # 所以这里【不加 set -e】，每条命令都容错。
-          echo "== 释放前 =="; df -h / 2>/dev/null || true
+          # 注意：这一步只是内存兜底，绝不能让它把整个构建搞挂。
+          # 源码已放 /mnt（~70GB），所以默认【不再清理系统目录】。
+          echo "== 当前磁盘 =="; df -h / /mnt 2>/dev/null || true
           if [ "$IN_FREE_DISK" = "true" ]; then
-            # 只删我们确定用不到的 runner 预装 SDK（不碰 /usr/lib/jvm 之外的运行时）
+            echo "[i] free_disk=true -> 清理 runner 预装 SDK（只删我们确定用不到的）"
             sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                         /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
                         /usr/share/swift /usr/local/.ghcup \
                         2>/dev/null || echo "[WARN] 删除部分目录失败，忽略"
             sudo apt-get clean 2>/dev/null || true
           else
-            echo "[i] free_disk=false，跳过磁盘清理（构建需 ~30GB，可能 No space left）"
+            echo "[i] free_disk=false -> 不清理任何系统目录（仅按需加 swap）"
           fi
-          echo "== 释放后 =="; df -h / 2>/dev/null || true
+          echo "== 清理后 =="; df -h / 2>/dev/null || true
 
           # swap 只是内存兜底；GitHub runner 上 swapon 有时会被拒，失败也必须继续
           if [ "$IN_SWAP" = "true" ]; then
-            if [ ! -f /swapfile ]; then
-              sudo fallocate -l 8G /swapfile 2>/dev/null \
-                || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 2>/dev/null \
+            SWDIR="/mnt"
+            [ -w "$SWDIR" ] || SWDIR="/"
+            if [ ! -f "$SWDIR/swapfile" ]; then
+              sudo fallocate -l 8G "$SWDIR/swapfile" 2>/dev/null \
+                || sudo dd if=/dev/zero of="$SWDIR/swapfile" bs=1M count=8192 2>/dev/null \
                 || echo "[WARN] 创建 swapfile 失败，忽略"
             fi
-            sudo chmod 600 /swapfile 2>/dev/null || true
-            sudo mkswap /swapfile >/dev/null 2>&1 || echo "[WARN] mkswap 失败，忽略"
-            sudo swapon /swapfile 2>&1 || echo "[WARN] swapon 被拒，忽略"
+            sudo chmod 600 "$SWDIR/swapfile" 2>/dev/null || true
+            sudo mkswap "$SWDIR/swapfile" >/dev/null 2>&1 || echo "[WARN] mkswap 失败，忽略"
+            sudo swapon "$SWDIR/swapfile" 2>&1 || echo "[WARN] swapon 被拒，忽略"
           fi
           free -h 2>/dev/null || true
           echo "[OK] 准备步骤结束"
@@ -172,11 +207,32 @@ jobs:
           git config --global user.name  "kernel-ci"
           git config --global user.email "kernel-ci@localhost"
 
+      - name: 恢复内核源码 / clang 缓存（命中可省掉 10 分钟级 clone）
+        id: cache_kernel
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          # key 里带 commit：换了 commit 就不会复用旧树（否则版本串/vendor 模块会对不上）
+          key: sm8450-${{ inputs.lineage_branch }}-${{ inputs.kernel_commit }}-${{ inputs.clang_version }}-v1
+          path: |
+            ${{ steps.pick_ws.outputs.ws }}/common
+            ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
+
       - name: 组装内核工作区（内核树 + clang + build + dtc + modules）
         run: |
           set -e
           bash "$GITHUB_WORKSPACE/scripts/assemble-lineage-kernel.sh" \
                "$WS" "$IN_BRANCH" "$IN_COMMIT" "$IN_CLANG"
+
+      - name: 保存内核源码 / clang 缓存（失败不影响构建）
+        if: always() && steps.cache_kernel.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: sm8450-${{ inputs.lineage_branch }}-${{ inputs.kernel_commit }}-${{ inputs.clang_version }}-v1
+          path: |
+            ${{ steps.pick_ws.outputs.ws }}/common
+            ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
 
       - name: 写入 Docker/cgroup + ReSukiSU 配置
         run: |
@@ -226,11 +282,20 @@ jobs:
           ls -l "$WS/common/drivers/kernelsu" || true
           grep -n kernelsu "$WS/common/drivers/Makefile" || true
 
-      - name: 预生成合并 defconfig（含全部 5 个碎片 + 我们的配置 + thin LTO）
+      - name: 预生成合并 defconfig（gki_defconfig + 4 个碎片 + thin LTO）
         run: |
-          set -eo pipefail
-          bash "$GITHUB_WORKSPACE/scripts/preconfig-kernel.sh" "$WS" "$WS/out/common" 2>&1 \
-            | tee "$GITHUB_WORKSPACE/build.log"
+          # 脚本自己写日志（PRECONFIG_LOG），失败时会用 ::error:: 发出注解
+          # —— 因为 Actions 的 job log 接口需要仓库 admin 权限（匿名 403），
+          #    而 check-runs 的 annotations 是匿名可读的，这样失败原因才拿得到。
+          set -uo pipefail
+          export PRECONFIG_LOG="$GITHUB_WORKSPACE/build.log"
+          bash "$GITHUB_WORKSPACE/scripts/preconfig-kernel.sh" "$WS" "$WS/out/common"
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=preconfig 失败::退出码 $rc（细节见上方 ::error:: 注解与 build.log 产物）"
+            exit "$rc"
+          fi
+          echo "[OK] .config 已生成：$(ls -l "$WS/out/common/.config")"
 
       - name: 编译内核（直接 make Image）
         run: |
@@ -244,7 +309,12 @@ jobs:
           set -eo pipefail
           cd "$WS/common"
 
-          CLANG_BIN="$(ls -d "$WS"/prebuilts-master/clang/host/linux-x86/*/bin | head -1)"
+          CLANG_BIN="$(ls -d "$WS"/prebuilts-master/clang/host/linux-x86/*/bin 2>/dev/null | head -1 || true)"
+          if [ -z "$CLANG_BIN" ] || [ ! -x "$CLANG_BIN/clang" ]; then
+            echo "::error title=clang 缺失::没找到 $WS/prebuilts-master/clang/host/linux-x86/*/bin/clang"
+            ls -la "$WS/prebuilts-master/clang/host/linux-x86/" 2>&1 || true
+            exit 1
+          fi
           echo "[+] clang: $CLANG_BIN"
           "$CLANG_BIN/clang" --version | head -2
           export PATH="$CLANG_BIN:$PATH"
@@ -257,19 +327,48 @@ jobs:
 
           OUT="$WS/out/common"
           mkdir -p "$OUT"
+          [ -s "$OUT/.config" ] || { echo "::error::$OUT/.config 不存在（preconfig 没跑成功）"; exit 1; }
+          # KCONFIG_CONFIG 用绝对路径：内核顶层 Makefile 是 `KCONFIG_CONFIG ?= .config`（相对），
+          # 导出绝对路径可以确保 make 读到的就是我们刚生成的那份 .config。
+          export KCONFIG_CONFIG="$(cd "$OUT" && pwd)/.config"
+          echo "[+] 复用 $KCONFIG_CONFIG（$(grep -c '^CONFIG_' "$KCONFIG_CONFIG") 行 CONFIG_）"
+
+          # 把关键编译期配置先打出来，便于事后核对
+          grep -E '^CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|KSU|CGROUP_DEVICE|PID_NS|SYSVIPC)=' \
+            "$KCONFIG_CONFIG" | sed 's/^/    /' || true
+
           echo "== 开始编译 Image（预计 20~60 分钟）=="
+          # 暂时关掉 -e：要把 make 的真实退出码抓出来并转成 ::error:: 注解，
+          # 否则 `make | tee` 一旦失败就直接跳出，什么都看不到。
+          set +e
           make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
                CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
                OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld \
                Image -j"$(nproc)" 2>&1 \
             | tee -a "$GITHUB_WORKSPACE/build.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=内核编译失败::make 退出码 $rc"
+            # 把报错行发成注解（job log 接口要 admin 权限，注解匿名可读）
+            grep -nE 'error:|Error [0-9]|No rule to make target|command not found|undefined reference|fatal error|Killed|out of memory' \
+              "$GITHUB_WORKSPACE/build.log" 2>/dev/null | tail -25 | while IFS= read -r l; do
+              printf '::error::%s\n' "$l"
+            done
+            tail -n 12 "$GITHUB_WORKSPACE/build.log" 2>/dev/null | while IFS= read -r l; do
+              printf '::error::%s\n' "$l"
+            done
+            exit "$rc"
+          fi
 
           echo "== 产物检查 =="
           ls -la "$OUT/arch/arm64/boot/" 2>/dev/null | head -20 || true
           IMG="$OUT/arch/arm64/boot/Image"
           if [ ! -s "$IMG" ]; then
-            echo "::error::没编出 $IMG，请看 build.log 产物"
+            echo "::error title=产物缺失::没编出 $IMG"
+            find "$OUT" -maxdepth 4 -type d | head -40 || true
             exit 1
           fi
           echo "[OK] 内核镜像: $IMG  ($(du -h "$IMG" | cut -f1))"
@@ -285,7 +384,16 @@ jobs:
         continue-on-error: true
         run: |
           OUT="$WS/out/common"
-          REL="$(make -s -C "$WS/common" O="$OUT" ARCH=arm64 kernelrelease 2>/dev/null || true)"
+          # 优先直接读构建生成的 kernel.release（最准，不依赖 make 再跑一遍）
+          REL=""
+          if [ -f "$OUT/include/config/kernel.release" ]; then
+            REL="$(cat "$OUT/include/config/kernel.release" 2>/dev/null || true)"
+          fi
+          if [ -z "$REL" ]; then
+            CLANG_BIN="$(ls -d "$WS"/prebuilts-master/clang/host/linux-x86/*/bin 2>/dev/null | head -1 || true)"
+            [ -n "$CLANG_BIN" ] && export PATH="$CLANG_BIN:$PATH"
+            REL="$(make -s -C "$WS/common" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease 2>/dev/null || true)"
+          fi
           echo "设备实测 uname -r : $EXPECTED_RELEASE"
           echo "本次构建 release  : ${REL:-<取不到>}"
           if [ "$REL" = "$EXPECTED_RELEASE" ]; then
@@ -334,6 +442,29 @@ jobs:
             upload/**
             build.log
 
+      - name: 汇总诊断信息（无论成功失败都跑）
+        if: always()
+        run: |
+          # 源码现在放 /mnt 之类的绝对路径，upload-artifact 的 path 不展开环境变量，
+          # 所以先复制到一个工作区内的固定目录（diag/）再上传。
+          set +e
+          D="$GITHUB_WORKSPACE/diag"
+          mkdir -p "$D/defconfig" "$D/out"
+          cp -f "$GITHUB_WORKSPACE/build.log" "$D/" 2>/dev/null
+          echo "== 工作区 ==" > "$D/env.txt"
+          echo "WS=$WS" >> "$D/env.txt"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE" >> "$D/env.txt"
+          { echo "== df =="; df -h; echo; echo "== free =="; free -h; echo;
+            echo "== WS 顶层 =="; ls -la "$WS" 2>&1; } >> "$D/env.txt" 2>&1
+          cp -f "$WS"/build.env "$D/" 2>/dev/null
+          cp -f "$WS"/common/arch/arm64/configs/gki_defconfig "$D/defconfig/" 2>/dev/null
+          cp -f "$WS"/common/arch/arm64/configs/vendor/*.config "$D/defconfig/" 2>/dev/null
+          cp -f "$WS"/out/common/.config "$D/out/" 2>/dev/null
+          cp -f "$WS"/out/common/include/config/kernel.release "$D/out/" 2>/dev/null
+          du -sh "$D" 2>/dev/null
+          find "$D" -type f | sed 's/^/  /'
+          exit 0
+
       - name: 上传诊断日志（无论成功失败都传，方便排查）
         if: always()
         uses: actions/upload-artifact@v4
@@ -341,8 +472,4 @@ jobs:
           name: build-log-and-diagnostics
           if-no-files-found: warn
           retention-days: 14
-          path: |
-            build.log
-            kp/build.env
-            kp/common/arch/arm64/configs/gki_defconfig
-            kp/common/arch/arm64/configs/vendor/*.config
+          path: diag/**

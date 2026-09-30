@@ -79,7 +79,9 @@ clone_repo "https://github.com/LineageOS/android_kernel_xiaomi_sm8450" \
 if [ -n "$COMMIT" ]; then
   echo "[assemble] 钉住内核树 commit: $COMMIT"
   ( cd "$WS/common" && git fetch -q --depth=1 origin "$COMMIT" 2>/dev/null ) || true
-  if ( cd "$WS/common" && git checkout -q "$COMMIT" 2>/dev/null ); then
+  # -f：缓存恢复出来的树可能已被 assemble 自己 sed 过 build.config.common，
+  #     强行 checkout 保证源码树与目标 commit 完全一致（defconfig 的改动在 assemble 之后才做）。
+  if ( cd "$WS/common" && git checkout -f -q "$COMMIT" 2>/dev/null ); then
     SHA="$(cd "$WS/common" && git rev-parse HEAD)"
     echo "[assemble] 当前 HEAD = $SHA"
     case "$SHA" in
