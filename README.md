@@ -343,6 +343,35 @@ ls -lh out/target/product/unicorn/boot.img
 
 工作流：`.github/workflows/build-unicorn-kernel.yml`
 
+### 5.0 当前实际流程（已按真机调试结果定型）
+
+**不再走 `build/build.sh`**，原因见 5.1 末尾。现在的 20 步流程里，关键的是这几步：
+
+| # | 步骤 | 要点 |
+|---|---|---|
+| 2 | 选择构建工作区 | **自动挑空间最大的挂载点**。GitHub runner 上 `/mnt` 默认约 70 GB 空闲，而 `/` 只有约 14 GB，所以源码放 `/mnt/kp` → **完全不需要删除系统目录** |
+| 5 | 恢复缓存 | `actions/cache` 缓存内置核树与 clang，key 含 commit。重跑时不再重拉 10 GB |
+| 6 | 组装工作区 | 内核树 + clang + modules（+ build/dtc，仅作备用） |
+| 8 | 写入配置 | `apply-configs.sh` 把 Docker/cgroup + KSU 配置写进 `gki_defconfig` **本体** |
+| 10 | 集成 ReSukiSU | 软链 `drivers/kernelsu` + 改 `drivers/Makefile`、`drivers/Kconfig` |
+| 13 | 预生成 `.config` | `preconfig-kernel.sh`：`merge_config.sh` 合并 `gki_defconfig` + `waipio/xiaomi/unicorn_GKI.config` + `debugfs.config`，**再追加一个 thin-LTO 碎片**覆盖官方的 Full LTO |
+| 14 | 编译 | **直接 `make O=… Image`**（= LineageOS `kernel.mk` 的做法），只编 `Image`，不编 modules/dtbs |
+| 15~17 | 体检 / 打包 | `.config` 校验与版本串核对都设了 `continue-on-error`，**内核编出来了就不会被体检报告挡住打包** |
+
+**开关说明**
+
+- `free_disk`（默认 `false`）：源码已经在 `/mnt`，不需要清理任何系统目录。
+  只有当你把工作区强制放到 `/` 时才建议打开。
+- `enable_swap`（默认 `true`）：只加内存兜底，`swapon` 被拒也不会中断。
+- `enable_nftables`（默认 `true`）：Ubuntu 22.04+ 的 `iptables` 默认走 nft 后端，Docker 需要它。
+
+**失败时怎么定位**
+
+Actions 的 job log 接口需要仓库 admin 权限（匿名调用返回 `403`），
+但 **check-runs 的 annotations 是匿名可读的**。所以两个脚本在失败时都会用
+`::error::` 把关键报错发成注解，同时把完整输出写进 `build.log`（随产物上传）。
+这样即使没有仓库权限，也能直接看到失败原因。
+
 ### 5.1 为什么需要一个"组装"步骤
 
 `LineageOS/android_kernel_xiaomi_sm8450` 是**扁平的 ACK 风格内核树**，
@@ -380,20 +409,25 @@ ROOT_DIR=$PWD KERNEL_DIR=$PWD/common BUILD_CONFIG=common/build.config.msm.waipio
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `lineage_branch` | `lineage-22.2` | 必须和你手机上的 LineageOS 版本一致 |
+| `lineage_branch` | `lineage-23.2` | **已按你设备实测钉死** |
+| `kernel_commit` | `ef362912d37b761041709638c1e571d6394e9558` | 设备 `uname -r` 里的 `-g<sha>`，必须一致 |
+| `clang_version` | `clang-r416183b` | 与内核树 `build.config.common` 一致；报 clang 错误就换 `clang-r563880` |
 | `device` | `unicorn` | 只影响日志与产物命名 |
+| `variant` | `gki` | 建议 `gki` |
 | `resukisu_branch` | `main` | ReSukiSU 的分支/标签 |
 | `resukisu_hook` | `kprobes` | 5.10 GKI 首选；备选 `tracepoint` |
 | `enable_nftables` | `true` | chroot 里 Docker 用 iptables-nft 时需要 |
 | `enable_susfs` | `false` | 开了还得自己打 SUSFS 内核补丁 |
-| `variant` | `gki` | 建议 `gki` |
+| `free_disk` | `false` | 源码放 `/mnt`，默认**不需要**清理系统目录 |
+| `enable_swap` | `true` | 只做内存兜底，失败不中断 |
 
 产物：`Image`、`boot.img`、`.config`、`anykernel3-unicorn.zip`、`build.log`。
 
-> ⚠️ 老实说：**路径与工具链我都核实过**（`build/`、`external/dtc`、clang-r416183b），
-> 但自组装流程我没法在这里真正跑一遍（沙箱无网络、无 45GB 磁盘）。
-> 真正"一次就成"的是**路径 A**。路径 B 每一步都带自检与产物兜底查找，
-> 失败时日志会明确指出缺哪一项，而不是让你对着失败日志猜。
+> ⚠️ 老实说：**路径与工具链我都核实过**（`build/`、`external/dtc`、clang），
+> 但整个 Actions 流程我没法在这里真正跑一遍（沙箱无网络、无 45GB 磁盘）。
+> 我到目前做的验证是：脚本全部 `bash -n` 通过；用**你设备真实的 `.config`**
+> 当输入、配一个伪造 `make`，对 `preconfig-kernel.sh` 做了两轮端到端测试
+> （正常路径 26/26 项正确；源码树被污染路径能正确回退并清理干净）。
 
 ---
 
