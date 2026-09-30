@@ -249,12 +249,16 @@ chk() {
 }
 chk "内核树"              "$WS/common/Makefile"
 chk "gki_defconfig"       "$WS/common/arch/arm64/configs/gki_defconfig"
-chk "build.config.msm.waipio" "$WS/common/build.config.msm.waipio"
-chk "build.config.common" "$WS/common/build.config.common"
 chk "drivers/（KSU 集成点）" "$WS/common/drivers"
-chk "build/build.sh"      "$WS/build/build.sh"
 chk "clang"               "$CLANG_DIR/bin/clang"
-chk "external/dtc"        "$WS/external/dtc/Makefile"
+chk "主要碎片 waipio_GKI.config" "$WS/common/arch/arm64/configs/vendor/waipio_GKI.config"
+
+# build/ 与 external/dtc 现在只用于"备选"构建方式（默认走 directly make Image，不需要它们），
+# 所以缺失只告警、不阻断。
+for extra in "$WS/build/build.sh" "$WS/external/dtc/Makefile"; do
+  if [ -e "$extra" ]; then printf '  [OK]   %-46s %s\n' "备选依赖" "$extra"
+  else printf '  [WARN] %-46s 缺失（默认构建方式不需要）\n' "备选依赖" ; fi
+done
 
 # 外部模块只是附带产物：我们的交付物是内核 Image（AK3 只换 Image），
 # 所以 EXT_MODULES 缺失只告警、不阻断（否则会白白浪费一次构建）。

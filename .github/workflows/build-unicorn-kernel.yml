@@ -81,6 +81,22 @@ on:
         options:
           - 'true'
           - 'false'
+      free_disk:
+        description: '清理 runner 预装 SDK 腾磁盘（构建含 clone 约需 30GB；runner 默认只有 ~14GB 空闲，关掉很可能 No space left）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      enable_swap:
+        description: '创建 8GB swap（内存兜底；swapon 被拒也不会中断）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
   contents: read
@@ -102,6 +118,8 @@ jobs:
       IN_KSU_HOOK: ${{ inputs.resukisu_hook }}
       IN_NFTABLES: ${{ inputs.enable_nftables }}
       IN_SUSFS: ${{ inputs.enable_susfs }}
+      IN_FREE_DISK: ${{ inputs.free_disk }}
+      IN_SWAP: ${{ inputs.enable_swap }}
       # 设备实测 uname -r，用于校验 vermagic 是否一致
       EXPECTED_RELEASE: '5.10.260-gki-gef362912d37b'
 
@@ -114,22 +132,29 @@ jobs:
           # 注意：这一步只是压缩耗时/加内存兜底，绝不能让它把整个构建搞挂。
           # 所以这里【不加 set -e】，每条命令都容错。
           echo "== 释放前 =="; df -h / 2>/dev/null || true
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                      /usr/share/swift /usr/lib/jvm /usr/local/.ghcup \
-                      2>/dev/null || echo "[WARN] 删除部分目录失败，忽略"
-          sudo apt-get clean 2>/dev/null || true
+          if [ "$IN_FREE_DISK" = "true" ]; then
+            # 只删我们确定用不到的 runner 预装 SDK（不碰 /usr/lib/jvm 之外的运行时）
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                        /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                        /usr/share/swift /usr/local/.ghcup \
+                        2>/dev/null || echo "[WARN] 删除部分目录失败，忽略"
+            sudo apt-get clean 2>/dev/null || true
+          else
+            echo "[i] free_disk=false，跳过磁盘清理（构建需 ~30GB，可能 No space left）"
+          fi
           echo "== 释放后 =="; df -h / 2>/dev/null || true
 
           # swap 只是内存兜底；GitHub runner 上 swapon 有时会被拒，失败也必须继续
-          if [ ! -f /swapfile ]; then
-            sudo fallocate -l 8G /swapfile 2>/dev/null \
-              || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 2>/dev/null \
-              || echo "[WARN] 创建 swapfile 失败，忽略"
+          if [ "$IN_SWAP" = "true" ]; then
+            if [ ! -f /swapfile ]; then
+              sudo fallocate -l 8G /swapfile 2>/dev/null \
+                || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 2>/dev/null \
+                || echo "[WARN] 创建 swapfile 失败，忽略"
+            fi
+            sudo chmod 600 /swapfile 2>/dev/null || true
+            sudo mkswap /swapfile >/dev/null 2>&1 || echo "[WARN] mkswap 失败，忽略"
+            sudo swapon /swapfile 2>&1 || echo "[WARN] swapon 被拒，忽略"
           fi
-          sudo chmod 600 /swapfile 2>/dev/null || true
-          sudo mkswap /swapfile >/dev/null 2>&1 || echo "[WARN] mkswap 失败，忽略"
-          sudo swapon /swapfile 2>&1 || echo "[WARN] swapon 被拒，忽略（无 swap 也能编，只是并行度要保守）"
           free -h 2>/dev/null || true
           echo "[OK] 准备步骤结束"
 
@@ -201,37 +226,66 @@ jobs:
           ls -l "$WS/common/drivers/kernelsu" || true
           grep -n kernelsu "$WS/common/drivers/Makefile" || true
 
-      - name: 编译内核
+      - name: 预生成合并 defconfig（含全部 5 个碎片 + 我们的配置 + thin LTO）
         run: |
-          set -e
-          cd "$WS"
-          set -a
-          # shellcheck disable=SC1091
-          . "$WS/build.env"
-          set +a
-          export VARIANT="$IN_VARIANT"
-          export SKIP_MRPROPER=1
-          echo "ROOT_DIR=$ROOT_DIR"
-          echo "KERNEL_DIR=$KERNEL_DIR"
-          echo "BUILD_CONFIG=$BUILD_CONFIG VARIANT=$VARIANT LTO=$LTO"
-          echo "== 运行 build/build.sh =="
-          ./build/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-          echo "== 查找产物 =="
-          find "$WS/out" -maxdepth 6 -type f \( -name 'Image' -o -name 'boot.img' \
-            -o -name 'vendor_dlkm.img' -o -name 'dtb.img' -o -name 'dtbo.img' \) -print || true
-          echo "== DTB/DTS 目录情况（排查 dtbs 失败用） =="
-          ls -la "$WS/common/arch/arm64/boot/dts/vendor" 2>/dev/null || echo "(无 arch/arm64/boot/dts/vendor)"
-          ls -la "$WS/devicetrees" 2>/dev/null | head -20 || true
+          set -eo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/preconfig-kernel.sh" "$WS" "$WS/out/common" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: 校验最终 .config（并比对内核版本串）
+      - name: 编译内核（直接 make Image）
         run: |
-          set -e
-          KERNEL_TREE="$WS/common" bash "$GITHUB_WORKSPACE/scripts/verify-built-config.sh" "$WS/out"
+          # 为什么不用 build/build.sh：
+          #  1) 它内部的 merge_defconfig_fragments 有 "ERROR! Detected overridden config!" /
+          #     "ERROR! Treating config warnings as errors" 两处 1~2 秒就退出的硬检查，
+          #     上一轮就是被它秒退、又被 `| tee` 吞掉退出码，表现为"0 秒成功"。
+          #  2) 它只会合并 waipio_GKI.config，丢掉 xiaomi_/unicorn_GKI.config（设备专属配置）。
+          #  3) 我们只需要 Image（AK3 只换 Image），不需要 modules/dtbs/vendor_dlkm。
+          # 所以直接 make，和 LineageOS 自己在 kernel.mk 里做的事一致。
+          set -eo pipefail
+          cd "$WS/common"
+
+          CLANG_BIN="$(ls -d "$WS"/prebuilts-master/clang/host/linux-x86/*/bin | head -1)"
+          echo "[+] clang: $CLANG_BIN"
+          "$CLANG_BIN/clang" --version | head -2
+          export PATH="$CLANG_BIN:$PATH"
+
+          export KBUILD_BUILD_HOST=build-host
+          export KBUILD_BUILD_USER=build-user
+          export SOURCE_DATE_EPOCH="$(git -C "$WS/common" log -1 --pretty=%ct)"
+          export KBUILD_BUILD_TIMESTAMP="$(LC_ALL=C date -u -d "@$SOURCE_DATE_EPOCH" '+%a %b %d %H:%M:%S UTC %Y')"
+          echo "[+] SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH  ($KBUILD_BUILD_TIMESTAMP)"
+
+          OUT="$WS/out/common"
+          mkdir -p "$OUT"
+          echo "== 开始编译 Image（预计 20~60 分钟）=="
+          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+               CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+               OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld \
+               Image -j"$(nproc)" 2>&1 \
+            | tee -a "$GITHUB_WORKSPACE/build.log"
+
+          echo "== 产物检查 =="
+          ls -la "$OUT/arch/arm64/boot/" 2>/dev/null | head -20 || true
+          IMG="$OUT/arch/arm64/boot/Image"
+          if [ ! -s "$IMG" ]; then
+            echo "::error::没编出 $IMG，请看 build.log 产物"
+            exit 1
+          fi
+          echo "[OK] 内核镜像: $IMG  ($(du -h "$IMG" | cut -f1))"
+
+      - name: 校验最终 .config（仅供参考，不阻断打包/上传）
+        continue-on-error: true
+        run: |
+          # 注意：内核已经编出来了，这一步只是体检报告，绝不能因为它挡住后面的 AK3 打包。
+          KERNEL_TREE="$WS/common" bash "$GITHUB_WORKSPACE/scripts/verify-built-config.sh" "$WS/out" \
+            || echo "::warning::校验脚本报了问题（把上面的表格发我即可），后续打包继续"
 
       - name: 核对内核 release（决定能否直接加载 ROM 现成模块）
+        continue-on-error: true
         run: |
-          set -e
-          REL="$(make -s -C "$WS/common" kernelrelease 2>/dev/null || true)"
+          OUT="$WS/out/common"
+          REL="$(make -s -C "$WS/common" O="$OUT" ARCH=arm64 kernelrelease 2>/dev/null || true)"
           echo "设备实测 uname -r : $EXPECTED_RELEASE"
           echo "本次构建 release  : ${REL:-<取不到>}"
           if [ "$REL" = "$EXPECTED_RELEASE" ]; then
@@ -239,6 +293,7 @@ jobs:
           else
             echo "::warning::版本串与设备不一致，刷完可能出现 WiFi/蓝牙/音频失效。"
             echo "::warning::请确认 kernel_commit 是否为 ef362912d37b761041709638c1e571d6394e9558"
+            echo "::warning::以及内核树里 LOCALVERSION_AUTO / LOCALVERSION 的实际取值"
           fi
 
       - name: 收集产物并打包 AnyKernel3
@@ -279,12 +334,12 @@ jobs:
             upload/**
             build.log
 
-      - name: 上传失败日志（仅失败时）
-        if: failure()
+      - name: 上传诊断日志（无论成功失败都传，方便排查）
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-failure-logs
-          if-no-files-found: ignore
+          name: build-log-and-diagnostics
+          if-no-files-found: warn
           retention-days: 14
           path: |
             build.log
