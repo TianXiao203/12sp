@@ -1,0 +1,282 @@
+name: Build unicorn kernel (LineageOS + ReSukiSU + Docker cgroups)
+
+# =============================================================================
+# 小米 12S Pro (unicorn) + LineageOS 5.10 GKI 内核
+#   - 源码: LineageOS/android_kernel_xiaomi_sm8450（+ devicetrees / modules）
+#   - 集成 ReSukiSU（不是原版 KernelSU）
+#   - 开启 Docker 所需的 cgroup / namespace 配置
+#     重点是 CONFIG_CGROUP_DEVICE（GKI defconfig 里根本没有这一项）
+#     以及 CONFIG_PID_NS（GKI 里被显式关闭成 "# CONFIG_PID_NS is not set"）
+#
+# 产物: Image / boot.img / .config / anykernel3-unicorn.zip / build.log
+#
+# 说明：内核分支必须与你手机上的 LineageOS 大版本一致，否则 vermagic 不匹配，
+#       ROM 里现成的 vendor 模块会加载失败（能开机但 WiFi/蓝牙/音频废）。
+#       adb shell getprop ro.lineage.build.version   查看设备版本
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      lineage_branch:
+        description: 'LineageOS 内核分支（已按实测设备钉为 23.2）'
+        required: true
+        default: 'lineage-23.2'
+        type: choice
+        options:
+          - lineage-23.2
+          - lineage-23.1
+          - lineage-23.0
+          - lineage-22.2
+      kernel_commit:
+        description: '钉住内核树 commit（设备 kernel release 含 -g<sha>，必须一致）'
+        required: true
+        default: 'ef362912d37b761041709638c1e571d6394e9558'
+      clang_version:
+        description: 'clang 版本（默认与内核树 build.config.common 一致；报 clang 错误就换成 clang-r563880）'
+        required: true
+        default: 'clang-r416183b'
+        type: choice
+        options:
+          - clang-r416183b
+          - clang-r563880
+      device:
+        description: '设备代号（小米 12S Pro = unicorn）'
+        required: true
+        default: 'unicorn'
+      variant:
+        description: '构建变体（gki 推荐）'
+        required: true
+        default: 'gki'
+        type: choice
+        options:
+          - gki
+          - consolidate
+      resukisu_branch:
+        description: 'ReSukiSU 分支/标签/commit'
+        required: true
+        default: 'main'
+      resukisu_hook:
+        description: 'KSU hook 模式（5.10 GKI 首选 kprobes）'
+        required: true
+        default: 'kprobes'
+        type: choice
+        options:
+          - kprobes
+          - tracepoint
+          - manual
+      enable_nftables:
+        description: '开启 nftables 族（chroot 里 Docker 用 iptables-nft 时需要）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      enable_susfs:
+        description: '开启 SUSFS（还需自行打内核侧补丁，默认关）'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build LineageOS 5.10 GKI kernel for unicorn
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      WS: ${{ github.workspace }}/kp
+      IN_BRANCH: ${{ inputs.lineage_branch }}
+      IN_COMMIT: ${{ inputs.kernel_commit }}
+      IN_CLANG: ${{ inputs.clang_version }}
+      IN_DEVICE: ${{ inputs.device }}
+      IN_VARIANT: ${{ inputs.variant }}
+      IN_KSU_BRANCH: ${{ inputs.resukisu_branch }}
+      IN_KSU_HOOK: ${{ inputs.resukisu_hook }}
+      IN_NFTABLES: ${{ inputs.enable_nftables }}
+      IN_SUSFS: ${{ inputs.enable_susfs }}
+      # 设备实测 uname -r，用于校验 vermagic 是否一致
+      EXPECTED_RELEASE: '5.10.260-gki-gef362912d37b'
+
+    steps:
+      - name: Checkout build kit
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间并增加 swap（内核树 + clang 很大）
+        run: |
+          set -e
+          echo "== 释放前 =="; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/lib/jvm /usr/local/.ghcup
+          sudo apt-get clean
+          echo "== 释放后 =="; df -h /
+          sudo fallocate -l 12G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=12288
+          sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          free -h
+
+      - name: 安装构建依赖
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex \
+            g++-multilib gcc-multilib git gnupg gperf lib32ncurses5-dev \
+            lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses5 \
+            libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop \
+            pngcrush python3 python3-pip rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev kmod unzip
+          git config --global user.name  "kernel-ci"
+          git config --global user.email "kernel-ci@localhost"
+
+      - name: 组装内核工作区（内核树 + clang + build + dtc + modules）
+        run: |
+          set -e
+          bash "$GITHUB_WORKSPACE/scripts/assemble-lineage-kernel.sh" \
+               "$WS" "$IN_BRANCH" "$IN_COMMIT" "$IN_CLANG"
+
+      - name: 写入 Docker/cgroup + ReSukiSU 配置
+        run: |
+          set -e
+          bash "$GITHUB_WORKSPACE/scripts/apply-configs.sh" \
+               "$WS/common" \
+               "$GITHUB_WORKSPACE/configs/docker-cgroup.fragment"
+
+      - name: 按需关闭 nftables
+        if: ${{ inputs.enable_nftables == 'false' }}
+        run: |
+          set -e
+          DEF="$WS/common/arch/arm64/configs/gki_defconfig"
+          sed -i '/^CONFIG_NF_TABLES=/d; /^CONFIG_NF_TABLES_BRIDGE=/d; /^CONFIG_BRIDGE_NETFILTER=/d' "$DEF"
+          echo "[+] 已移除 NF_TABLES / NF_TABLES_BRIDGE / BRIDGE_NETFILTER"
+
+      - name: 集成 ReSukiSU
+        run: |
+          set -e
+          bash "$GITHUB_WORKSPACE/scripts/integrate-resukisu.sh" \
+               "$WS/common" "$IN_KSU_BRANCH" "$IN_KSU_HOOK"
+
+      - name: 按需开启 SUSFS
+        if: ${{ inputs.enable_susfs == 'true' }}
+        run: |
+          set -e
+          DEF="$WS/common/arch/arm64/configs/gki_defconfig"
+          sed -i '/^CONFIG_KSU_SUSFS=/d' "$DEF"
+          echo 'CONFIG_KSU_SUSFS=y' >> "$DEF"
+          echo "::warning::已开 CONFIG_KSU_SUSFS=y；SUSFS 还需按内核版本打 susfs4ksu 内核侧补丁，否则编译会失败。"
+
+      - name: 确认本树实际使用的 defconfig 碎片
+        run: |
+          set -e
+          DEF="$WS/common/arch/arm64/configs/gki_defconfig"
+          echo "== TARGET_KERNEL_CONFIG 期望的组合（gki_defconfig 是 base）=="
+          echo "   gki_defconfig"
+          echo "   vendor/waipio_GKI.config"
+          echo "   vendor/xiaomi_GKI.config"
+          echo "   vendor/${IN_DEVICE}_GKI.config"
+          echo "   vendor/debugfs.config"
+          echo "== 本树 vendor/ 下的碎片文件 =="
+          ls -1 "$WS/common/arch/arm64/configs/vendor/" 2>/dev/null || true
+          echo "== 关键配置最终状态（都应出现在 gki_defconfig 本体里）=="
+          grep -nE '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SECCOMP_FILTER|KSU|KSU_[A-Z_]+|KPROBES|LOCALVERSION)=' "$DEF" || true
+          echo "== drivers/ 里的 KSU 集成痕迹 =="
+          ls -l "$WS/common/drivers/kernelsu" || true
+          grep -n kernelsu "$WS/common/drivers/Makefile" || true
+
+      - name: 编译内核
+        run: |
+          set -e
+          cd "$WS"
+          set -a
+          # shellcheck disable=SC1091
+          . "$WS/build.env"
+          set +a
+          export VARIANT="$IN_VARIANT"
+          export SKIP_MRPROPER=1
+          echo "ROOT_DIR=$ROOT_DIR"
+          echo "KERNEL_DIR=$KERNEL_DIR"
+          echo "BUILD_CONFIG=$BUILD_CONFIG VARIANT=$VARIANT LTO=$LTO"
+          echo "== 运行 build/build.sh =="
+          ./build/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "== 查找产物 =="
+          find "$WS/out" -maxdepth 6 -type f \( -name 'Image' -o -name 'boot.img' \
+            -o -name 'vendor_dlkm.img' -o -name 'dtb.img' -o -name 'dtbo.img' \) -print || true
+          echo "== DTB/DTS 目录情况（排查 dtbs 失败用） =="
+          ls -la "$WS/common/arch/arm64/boot/dts/vendor" 2>/dev/null || echo "(无 arch/arm64/boot/dts/vendor)"
+          ls -la "$WS/devicetrees" 2>/dev/null | head -20 || true
+
+      - name: 校验最终 .config（并比对内核版本串）
+        run: |
+          set -e
+          KERNEL_TREE="$WS/common" bash "$GITHUB_WORKSPACE/scripts/verify-built-config.sh" "$WS/out"
+
+      - name: 核对内核 release（决定能否直接加载 ROM 现成模块）
+        run: |
+          set -e
+          REL="$(make -s -C "$WS/common" kernelrelease 2>/dev/null || true)"
+          echo "设备实测 uname -r : $EXPECTED_RELEASE"
+          echo "本次构建 release  : ${REL:-<取不到>}"
+          if [ "$REL" = "$EXPECTED_RELEASE" ]; then
+            echo "[OK] 完全一致 -> 只需刷 boot.img / AK3，ROM 里现成的 vendor 模块可直接加载"
+          else
+            echo "::warning::版本串与设备不一致，刷完可能出现 WiFi/蓝牙/音频失效。"
+            echo "::warning::请确认 kernel_commit 是否为 ef362912d37b761041709638c1e571d6394e9558"
+          fi
+
+      - name: 收集产物并打包 AnyKernel3
+        run: |
+          set -e
+          IMAGE="$(find "$WS/out" -maxdepth 8 -type f -name 'Image' -print -quit || true)"
+          if [ -z "$IMAGE" ]; then
+            echo "::error::没找到 Image，编译产物不完整"
+            find "$WS/out" -maxdepth 4 -type d | head -40 || true
+            exit 1
+          fi
+          echo "[+] Image = $IMAGE"
+
+          mkdir -p "$GITHUB_WORKSPACE/upload" "$GITHUB_WORKSPACE/ak3dist"
+          cp -f "$IMAGE" "$GITHUB_WORKSPACE/ak3dist/Image"
+          cp -f "$IMAGE" "$GITHUB_WORKSPACE/upload/Image"
+
+          for f in boot.img vendor_dlkm.img dtb.img dtbo.img; do
+            SRC="$(find "$WS/out" -maxdepth 6 -type f -name "$f" -print -quit || true)"
+            if [ -n "$SRC" ]; then cp -f "$SRC" "$GITHUB_WORKSPACE/upload/"; echo "  [+] $f"; fi
+          done || true
+
+          CFG="$(find "$WS/out" -maxdepth 8 -type f -name '.config' -print -quit || true)"
+          if [ -n "$CFG" ]; then cp -f "$CFG" "$GITHUB_WORKSPACE/upload/kernel.config.txt"; fi
+          cp -f "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/upload/" 2>/dev/null || true
+
+          bash "$GITHUB_WORKSPACE/scripts/pack-anykernel3.sh" \
+               "$GITHUB_WORKSPACE/ak3dist" "$GITHUB_WORKSPACE/AnyKernel3" \
+               "$GITHUB_WORKSPACE/upload/anykernel3-unicorn.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-lineage-kernel-resukisu-docker-cgroup
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            upload/**
+            build.log
+
+      - name: 上传失败日志（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-logs
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            build.log
+            kp/build.env
+            kp/common/arch/arm64/configs/gki_defconfig
+            kp/common/arch/arm64/configs/vendor/*.config

@@ -1,0 +1,121 @@
+# =============================================================================
+# 小米 12S Pro (unicorn) + LineageOS  5.10 GKI
+# Docker / containerd 所需内核配置 + ReSukiSU
+#
+# 写入位置（重要）：
+#   kernel/xiaomi/sm8450/arch/arm64/configs/gki_defconfig
+#   即 defconfig 本体，直接追加到文件末尾。
+#
+# 为什么不能写碎片 —— LineageOS 官方 device 树里写着：
+#   TARGET_KERNEL_CONFIG := gki_defconfig \
+#                           vendor/waipio_GKI.config \
+#                           vendor/xiaomi_GKI.config \
+#                           vendor/$(PRODUCT_DEVICE)_GKI.config \
+#                           vendor/debugfs.config
+# 即 gki_defconfig 是 base，其余全是碎片；而 build.config.msm.common 的
+# merge_defconfig_fragments() 一旦检测到
+#   "Previous value: CONFIG_X=[ym]"
+# 就直接 "ERROR! Detected overridden config!" 退出；随后的
+# check_merged_defconfig() 还要求最终 .config 与 defconfig 的差异全部是新增行。
+# 所以：碎片只能"新增"，改已有值会直接编译失败。
+#   - CONFIG_PID_NS 在 base 里是 "# CONFIG_PID_NS is not set" → 必须改本体
+#   - 唯一例外：CONFIG_LOCALVERSION 在 vendor/waipio_GKI.config 里是 "-gki"，
+#     要改只能改碎片（本方案不需要改它）
+#
+# 说明：没有 "=y" 的项表示该符号在此内核的 defconfig 里【完全没有这一行】，
+#       等价于默认值 n，必须显式追加才能开启
+#       （CGROUP_DEVICE / CGROUP_PIDS / USER_NS / NF_TABLES 都属于这一类）。
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. cgroup 基础  —— 重点是 CONFIG_CGROUP_DEVICE
+#    【实测设备状态】CONFIG_CGROUP_DEVICE 与 CONFIG_CGROUP_PIDS 在设备的
+#    /proc/config.gz 里都是 "# ... is not set"；Kconfig 里
+#    config CGROUP_DEVICE 是 bool "Device controller" 且没有 default y，
+#    所以默认就是 n。
+#    Docker 的 devices 白名单、以及模块日志里的
+#    "Devices cgroup controller not available." 都指向它。
+#    （设备 /proc/cgroups 里确实没有 devices 这一行，已实测确认。）
+# -----------------------------------------------------------------------------
+CONFIG_CGROUPS=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CPUSETS=y
+CONFIG_MEMCG=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_BLK_CGROUP=y
+
+
+# -----------------------------------------------------------------------------
+# 2. 命名空间
+#    【实测设备状态】adbd 拉下来的 /proc/config.gz 显示：
+#      CONFIG_NAMESPACES=y / NET_NS=y / UTS_NS=y   -> 本来就是开的
+#      # CONFIG_PID_NS is not set                  -> 被显式关闭（脚本改本体那一行）
+#      # CONFIG_USER_NS is not set                 -> 5.10 里 default n
+#      CONFIG_IPC_NS 这一行【完全不存在】          -> 因为依赖未满足，见下
+#      # CONFIG_SYSVIPC is not set
+#      # CONFIG_POSIX_MQUEUE is not set
+#    Kconfig: config IPC_NS  depends on (SYSVIPC || POSIX_MQUEUE)
+#    所以设备上根本没有 IPC namespace —— 这是你清单里漏掉的一项。
+#    Docker/runc 创建容器默认会要一个私有 IPC namespace，
+#    因此这里必须补 CONFIG_SYSVIPC=y，IPC_NS 才会跟着变成 y。
+# -----------------------------------------------------------------------------
+CONFIG_NAMESPACES=y
+CONFIG_NET_NS=y
+CONFIG_PID_NS=y
+CONFIG_UTS_NS=y
+CONFIG_USER_NS=y
+
+# IPC namespace 的前置条件（设备上原本是 not set）
+CONFIG_SYSVIPC=y
+CONFIG_IPC_NS=y
+
+
+# -----------------------------------------------------------------------------
+# 3. 网络 / 联合文件系统
+#    VETH / BRIDGE / OVERLAY_FS 已经是 =y，列出便于校验。
+#    BRIDGE_NETFILTER 与 NF_TABLES 族在 gki_defconfig 里不存在（默认 n）。
+#    Docker 默认的 bridge 网络用 iptables；Ubuntu 22.04+ 的 iptables 默认走
+#    nft 后端，所以这里把 nftables 一起打开（不需要则注释掉整段 NF_TABLES）。
+# -----------------------------------------------------------------------------
+CONFIG_VETH=y
+CONFIG_BRIDGE=y
+CONFIG_BRIDGE_NETFILTER=y
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_BRIDGE=y
+CONFIG_OVERLAY_FS=y
+
+
+# -----------------------------------------------------------------------------
+# 4. 安全 / BPF
+#    SECCOMP / SECCOMP_FILTER 定义在 arch/Kconfig，default y（本来就是开的）。
+#    CGROUP_BPF / BPF_SYSCALL 已经是 =y。
+# -----------------------------------------------------------------------------
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_CGROUP_BPF=y
+CONFIG_BPF_SYSCALL=y
+
+
+# -----------------------------------------------------------------------------
+# 5. ReSukiSU
+#    5.10 属于 GKI2：默认用 kprobes hook，不需要 CONFIG_KSU_MANUAL_HOOK，
+#    只要求 CONFIG_KPROBES=y（本内核已是 y）。
+#    如果刷入后管理器显示未安装，再把 TRACEPOINT 打开重编（两者不要同时开）。
+# -----------------------------------------------------------------------------
+CONFIG_KSU=y
+CONFIG_KSU_TOOLKIT_SUPPORT=y
+CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+# CONFIG_KSU_TRACEPOINT_HOOK=y        # 可选：kprobes hook 不可用时启用
+# CONFIG_KSU_SUSFS=y                  # 可选：需要自行打 susfs4ksu 内核补丁
+
+
+# -----------------------------------------------------------------------------
+# 6. 便于在手机上校验（可选但强烈建议）
+#    没有这两个，/proc/config.gz 不存在，就只能靠 /proc/cgroups 反推。
+# -----------------------------------------------------------------------------
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y

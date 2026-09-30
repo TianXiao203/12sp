@@ -1,0 +1,9 @@
+﻿CPU=AMD Ryzen 7 5800H with Radeon Graphics         
+Cores=8
+LogicalCPUs=16
+RAM_GB=13.9
+FreeRAM_GB=3.4
+Disk C: freeGB=127.2
+Disk D: freeGB=112.8
+Disk E: freeGB=47.2
+HypervisorPresent=True

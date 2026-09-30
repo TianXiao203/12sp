@@ -1,0 +1,18 @@
+# 构建工作区与产物（Node/内核都很大，绝不入库）
+kp/
+out/
+upload/
+ak3dist/
+AnyKernel3/
+build.log
+*.zip
+*.img
+*.tar.gz
+
+# defconfig 备份
+*.orig
+
+# 凭据永远不要入库
+*.pem
+.env
+remote.py
