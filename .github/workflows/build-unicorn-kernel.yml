@@ -137,28 +137,46 @@ jobs:
           df -h / /mnt /home/runner /tmp 2>/dev/null || true
           echo
           # GitHub 托管 runner 上 /dev/root 只有 ~14GB 空闲，而 /mnt 通常有 ~70GB。
-          # 把 10GB 级的内核源码 + clang + 编译产物全放 /mnt，就不需要删除
-          # runner 预装的 Android SDK / dotnet 之类（用户明确要求不要动它们）。
-          BEST=""
-          BEST_FREE=0
+          # 但 /mnt 默认属于 root、runner 用户写不进去，所以这里先试着 mkdir，
+          # 不行就用 sudo mkdir + chown 把所有权拿过来。
+          # 这样就不必为了腾空间去删 runner 预装的 Android SDK / dotnet 之类。
+          pick_dir() {
+            local d="$1" sub="$d/wbkernel"
+            [ -d "$d" ] || return 1
+            if mkdir -p "$sub" 2>/dev/null; then printf '%s' "$sub"; return 0; fi
+            if sudo mkdir -p "$sub" 2>/dev/null \
+               && sudo chown "$(id -u):$(id -g)" "$sub" 2>/dev/null; then
+              printf '%s' "$sub"; return 0
+            fi
+            return 1
+          }
+
+          BEST=""; BEST_FREE=0; BEST_MNT=""
           for d in /mnt /home/runner /tmp /; do
             [ -d "$d" ] || continue
-            [ -w "$d" ] || continue
             FREE_MB=$(df -Pm "$d" 2>/dev/null | awk 'NR==2{print $4}')
             [ -n "$FREE_MB" ] || continue
             echo "  候选 $d -> 可用 ${FREE_MB} MB"
-            if [ "$FREE_MB" -gt "$BEST_FREE" ]; then BEST="$d"; BEST_FREE="$FREE_MB"; fi
+            if [ "$FREE_MB" -gt "$BEST_FREE" ]; then
+              if W="$(pick_dir "$d")"; then
+                BEST="$W"; BEST_FREE="$FREE_MB"; BEST_MNT="$d"
+              else
+                echo "    -> 不可写，跳过"
+              fi
+            fi
           done
-          if [ -z "$BEST" ]; then BEST="/mnt"; fi
+          if [ -z "$BEST" ]; then BEST="/home/runner/wbkernel"; BEST_MNT="/"; fi
+
           WS="${BEST%/}/kp"
           echo "WS=$WS" >> "$GITHUB_ENV"
           # 同时输出到 step output：${{ env.* }} 取不到 GITHUB_ENV 的值，
           # 而 actions/cache 的 path 只能用表达式，所以这里必须显式输出。
           echo "ws=$WS" >> "$GITHUB_OUTPUT"
-          echo "::notice title=构建工作区:: $WS (可用约 $((BEST_FREE/1024)) GB)"
           mkdir -p "$WS"
+          echo "::notice title=构建工作区:: $WS (所在挂载点 $BEST_MNT，可用约 $((BEST_FREE/1024)) GB)"
           echo "== 选定后的空间 =="
           df -h "$WS"
+          df -h / 2>/dev/null || true
 
       - name: 释放磁盘空间并尝试增加 swap（纯优化，任何子步骤失败都不中断）
         run: |
