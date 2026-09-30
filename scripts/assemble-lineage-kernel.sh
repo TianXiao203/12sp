@@ -127,24 +127,46 @@ fi
 
 if [ ! -f "$WS/build/build.sh" ]; then
   rm -rf "$WS/build"
-  log "获取 build/（AOSP kernel/build 的 build.sh）"
-  # 源 1：AOSP googlesource（权威）
-  git clone --depth=1 https://android.googlesource.com/kernel/build "$WS/build" 2>/dev/null || true
-  # 源 2：GitHub 托管的镜像（已验证含 build.sh / build-tools / android / envsetup.sh）
-  if [ ! -f "$WS/build/build.sh" ]; then
+  log "获取 build/（需要 build/build.sh）"
+  # 源顺序：GitHub 镜像优先（内容已核实含 build.sh / build-tools / android / envsetup.sh），
+  # googlesource 放后面（在 GitHub runner 上通常可达，但优先级低一些）。
+  try_build_src() {
+    local url="$1" br="${2:-}"
+    log "尝试: $url ${br:+(-b $br)}"
+    if [ -n "$br" ]; then
+      git clone --depth=1 -b "$br" "$url" "$WS/build" 2>/dev/null
+    else
+      git clone --depth=1 "$url" "$WS/build" 2>/dev/null
+    fi
+    [ -f "$WS/build/build.sh" ]
+  }
+
+  MIRROR="https://github.com/xiaomi-sm8450-kernel/android_kernel_platform_build"
+  if try_build_src "$MIRROR" "zeus-s-oss"; then
+    echo "[assemble][OK] build/ 来自 GitHub 镜像 (zeus-s-oss)"
+  else
     rm -rf "$WS/build"
-    warn "googlesource 获取失败，改用 GitHub 镜像 xiaomi-sm8450-kernel/android_kernel_platform_build"
-    git clone --depth=1 https://github.com/xiaomi-sm8450-kernel/android_kernel_platform_build "$WS/build" 2>/dev/null || true
-    if [ ! -f "$WS/build/build.sh" ]; then
+    if try_build_src "$MIRROR"; then
+      echo "[assemble][OK] build/ 来自 GitHub 镜像 (默认分支)"
+    else
       rm -rf "$WS/build"
-      git clone --depth=1 -b kernel.lnx.5.10.r1-rel \
-        https://github.com/xiaomi-sm8450-kernel/android_kernel_platform_build "$WS/build" 2>/dev/null || true
+      if try_build_src "$MIRROR" "kernel.lnx.5.10.r1-rel"; then
+        echo "[assemble][OK] build/ 来自 GitHub 镜像 (kernel.lnx.5.10.r1-rel)"
+      else
+        rm -rf "$WS/build"
+        if try_build_src "https://android.googlesource.com/kernel/build" "main"; then
+          echo "[assemble][OK] build/ 来自 AOSP googlesource"
+        else
+          rm -rf "$WS/build"
+        fi
+      fi
     fi
   fi
+
   if [ -f "$WS/build/build.sh" ]; then
     echo "[assemble][OK] build/build.sh 就绪"
   else
-    warn "build/ 获取失败 —— 编译需要一个提供 build/build.sh 的仓库"
+    warn "build/ 获取失败 —— 编译需要一个提供 build/build.sh 的仓库，请检查网络或换源"
   fi
 fi
 
