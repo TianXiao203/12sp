@@ -65,3 +65,24 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
 源码/JDK 都放 `/mnt/wbkernel/kp`（runner 上 `/mnt` 约 70~86GB 可用，`/` 只有约 14GB），
 所以 `free_disk` 默认 `false`，**不需要清理任何系统目录**。
 注意 `/mnt` 属于 root，要先 `sudo mkdir + chown` 才能写。
+
+## AnyKernel3 的两个硬约束（都踩过）
+1. **`anykernel.sh` 里的变量必须大写**：
+   `BLOCK=` / `IS_SLOT_DEVICE=` / `RAMDISK_COMPRESSION=` / `PATCH_VBMETA_FLAG=`。
+   AK3 现行 core（含 clone 的 HEAD）只读大写；旧版里的
+   `[ "$block" ] && BLOCK="$block"` 小写兼容层已被删除。
+   写小写 → `BLOCK` 为空 → 刷机报 `Unable to determine  partition`
+   （**两个空格**就是 `$BLOCK` 为空的标志）。
+2. **脚本文件名必须是规范的小写 `anykernel.sh`**：
+   AK3 backend（`META-INF/com/google/android/update-binary`）里 `ash anykernel.sh`
+   写死小写。打包时要先清掉 `Anykernel.sh` 等大小写变体。
+   注意 Windows 文件系统不区分大小写，判断"是否存在大写变体"必须用
+   `ls -1 | grep` 比对真实名字，不能用 `[ -e Anykernel.sh ]`。
+
+## 免重编修 zip
+内核 Image 已经在内核 zip 里、只是脚本有问题时，不必重跑 16 分钟编译：
+`python scripts/patch-ak3-zip.py <原zip> anykernel3/anykernel.sh [输出zip]`
+
+## 提交状态（2026-10-01）
+`origin/main` = `178a3c7`；Run#5（sha `02ae2a7`）已全绿，
+版本串 `5.10.260-gki-gef362912d37b` 与设备逐字一致。
