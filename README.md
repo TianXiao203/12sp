@@ -345,32 +345,66 @@ ls -lh out/target/product/unicorn/boot.img
 
 ### 5.0 当前实际流程（已按真机调试结果定型）
 
-**不再走 `build/build.sh`**，原因见 5.1 末尾。现在的 20 步流程里，关键的是这几步：
+**不再走 `build/build.sh`**，原因见 5.1 末尾。现在的 22 步流程里，关键的是这几步：
 
 | # | 步骤 | 要点 |
 |---|---|---|
-| 2 | 选择构建工作区 | **自动挑空间最大的挂载点**。GitHub runner 上 `/mnt` 默认约 70 GB 空闲，而 `/` 只有约 14 GB，所以源码放 `/mnt/kp` → **完全不需要删除系统目录** |
-| 5 | 恢复缓存 | `actions/cache` 缓存内置核树与 clang，key 含 commit。重跑时不再重拉 10 GB |
-| 6 | 组装工作区 | 内核树 + clang + modules（+ build/dtc，仅作备用） |
-| 8 | 写入配置 | `apply-configs.sh` 把 Docker/cgroup + KSU 配置写进 `gki_defconfig` **本体** |
-| 10 | 集成 ReSukiSU | 软链 `drivers/kernelsu` + 改 `drivers/Makefile`、`drivers/Kconfig` |
-| 13 | 预生成 `.config` | `preconfig-kernel.sh`：`merge_config.sh` 合并 `gki_defconfig` + `waipio/xiaomi/unicorn_GKI.config` + `debugfs.config`，**再追加一个 thin-LTO 碎片**覆盖官方的 Full LTO |
-| 14 | 编译 | **直接 `make O=… Image`**（= LineageOS `kernel.mk` 的做法），只编 `Image`，不编 modules/dtbs |
-| 15~17 | 体检 / 打包 | `.config` 校验与版本串核对都设了 `continue-on-error`，**内核编出来了就不会被体检报告挡住打包** |
+| 2 | 预检仓库文件 | 1 秒。缺文件立刻点名（防止 `.gitignore` 漏文件导致白等 20 分钟） |
+| 3 | 选择构建工作区 | **自动挑空间最大的挂载点**。runner 上 `/mnt` 默认约 70~86 GB 空闲，`/` 只有约 14 GB，所以源码放 `/mnt/wbkernel/kp` → **完全不需要删除系统目录**（`/mnt` 属 root，脚本会用 `sudo mkdir+chown` 拿权限） |
+| 6 | 恢复缓存 | `actions/cache` 缓存内核树与 clang，key 含 commit。重跑时不再重拉 10 GB |
+| 7 | 组装工作区 | 内核树 + clang + modules（+ build/dtc，仅作备用）；**并冻结版本串**（见下） |
+| 9 | 写入配置 | `apply-configs.sh` 把 Docker/cgroup + KSU 配置写进 `gki_defconfig` **本体** |
+| 11 | 集成 ReSukiSU | 软链 `drivers/kernelsu` + 改 `drivers/Makefile`、`drivers/Kconfig` |
+| 14 | 预生成 `.config` | `preconfig-kernel.sh`：`merge_config.sh` 合并 `gki_defconfig` + `waipio/xiaomi/unicorn_GKI.config` + `debugfs.config`，**再追加一个 thin-LTO 碎片**覆盖官方的 Full LTO |
+| 15 | 编译 | **直接 `make O=… Image`**（= LineageOS `kernel.mk` 的做法），只编 `Image`，不编 modules/dtbs。实测约 **16 分钟**（4 核 runner） |
+| 17 | 核对版本串 | 与设备实测值逐字比对，不一致会发 `::error::` 注解并**明确提示先别刷** |
+| 18~19 | 打包 / 上传 | 生成 `anykernel3-unicorn.zip` |
+| 22 | 失败时推 `ci-diag` | 把 `build.log` 等诊断推到独立分支，**可匿名 clone**（见下） |
+
+#### ⚠️ 版本串必须精确一致（这条决定刷了之后 Wi-Fi 还在不在）
+
+目标值：**`5.10.260-gki-gef362912d37b`**
+
+内核树自带的 `scripts/setlocalversion` 有两处关键行为：
+
+- 工作树有**未提交改动**时会追加 `-dirty`；而我们**必须**改 `gki_defconfig`、
+  `drivers/Makefile`、`drivers/Kconfig` → 不处理就会编成
+  `5.10.260-gki-gef362912d37b-dirty`
+- 但只要**存在 `.scmversion` 文件，它会直接读该文件并 return**，跳过 `-dirty` 判断
+
+所以 `assemble-lineage-kernel.sh` 在**刚 checkout、树还干净时**写入：
+
+```sh
+printf '%s' "-g$(git rev-parse HEAD | cut -c1-12)" > $WS/common/.scmversion
+```
+
+得到的完整串 = `5.10.260` + `-gki`(来自 `CONFIG_LOCALVERSION`) + `-gef362912d37b`
+= `5.10.260-gki-gef362912d37b`，与设备**逐字一致**，且不受 dirty 状态、
+git 版本、`core.abbrev` 设置影响（12 位截取与脚本自身第 100 行一致）。
+
+> 为什么必须一致：`vermagic` 里含内核 release 串。只要差一个字符，
+> ROM 里现成的 `vendor_dlkm` / `vendor_boot` 模块就**全部加载失败**
+> —— 表现为能开机，但 Wi-Fi / 蓝牙 / 音频 / 相机全废。
 
 **开关说明**
 
 - `free_disk`（默认 `false`）：源码已经在 `/mnt`，不需要清理任何系统目录。
-  只有当你把工作区强制放到 `/` 时才建议打开。
 - `enable_swap`（默认 `true`）：只加内存兜底，`swapon` 被拒也不会中断。
 - `enable_nftables`（默认 `true`）：Ubuntu 22.04+ 的 `iptables` 默认走 nft 后端，Docker 需要它。
+- `push_diag_branch`（默认 `true`）：失败时把日志推到 `ci-diag` 分支。
 
-**失败时怎么定位**
+#### 失败时怎么定位
 
 Actions 的 job log 接口需要仓库 admin 权限（匿名调用返回 `403`），
-但 **check-runs 的 annotations 是匿名可读的**。所以两个脚本在失败时都会用
-`::error::` 把关键报错发成注解，同时把完整输出写进 `build.log`（随产物上传）。
-这样即使没有仓库权限，也能直接看到失败原因。
+artifact 下载也需要认证（匿名 `401`）—— 换句话说，**只靠 API 基本拿不到失败原因**。
+这里用了两条互补的路子：
+
+1. **`::error::` 注解**：`check-runs` 的 annotations 是**匿名可读**的。
+   所以所有关键失败路径都会主动 `echo "::error::<具体报错>"`，
+   版本串不一致时还会把**两侧的实际值**都写进注解。
+2. **推送 `ci-diag` 分支**（第 22 步，仅失败时）：把 `build.log` 与
+   `summary.txt`（含 `df`/`free`/`kernel.release`/`.scmversion`/目录清单）
+   推到独立分支 —— git 分支是可以匿名 clone 的，于是完整日志随时可读。
 
 ### 5.1 为什么需要一个"组装"步骤
 
@@ -420,6 +454,7 @@ ROOT_DIR=$PWD KERNEL_DIR=$PWD/common BUILD_CONFIG=common/build.config.msm.waipio
 | `enable_susfs` | `false` | 开了还得自己打 SUSFS 内核补丁 |
 | `free_disk` | `false` | 源码放 `/mnt`，默认**不需要**清理系统目录 |
 | `enable_swap` | `true` | 只做内存兜底，失败不中断 |
+| `push_diag_branch` | `true` | 失败时把 `build.log` 推到 `ci-diag` 分支（可匿名读，用于远程排错） |
 
 产物：`Image`、`boot.img`、`.config`、`anykernel3-unicorn.zip`、`build.log`。
 
@@ -628,3 +663,6 @@ anykernel3/anykernel.sh                    AnyKernel3 配置（device.name1=unic
 | 开机卡在 logo | DTB 不匹配 | 用 AK3 只换 Image（不要换 dtb）；不要手工拼 v3 header 包 |
 | `/proc/config.gz` 不存在 | 未开 `CONFIG_IKCONFIG_PROC` | 你设备本来就开了（实测 `=y`），无需处理 |
 | 刷完 `uname -r` 没变 | 刷到了非活动槽位 | 你设备活动槽是 `_b`；用 AK3 会自动处理，手工刷时确认目标分区 |
+| 编出来是 `5.10.260-gki-gef362912d37b-dirty` | 工作树有未提交改动，`setlocalversion` 追加了 `-dirty` | 已在 `assemble` 里写 `.scmversion` 冻结（见 5.0）；若仍出现，检查 `$WS/common/.scmversion` 是否存在 |
+| CI 上 `cp: cannot stat '.../anykernel3/anykernel.sh'`，步骤 1 秒失败且无报错 | 该文件被 `.gitignore` 的大小写冲突漏掉，从未入库 | `git check-ignore -v <文件>` 验证；**Windows 上绝不能写大小写只差的名字**（如 `AnyKernel3/` 会连 `anykernel3/` 一起忽略）。工作流第 2 步「预检」现在会提前拦下 |
+| 想知道 CI 到底报了什么，但 job log 要 admin 权限 | job log 接口匿名是 `403`，artifact 匿名是 `401` | 看 `ci-diag` 分支（失败时自动推送，含完整 `build.log`），或看 run 页面的 Annotations（`::error::` 匿名可读） |

@@ -45,5 +45,23 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
 - Actions job log 接口需 admin（匿名 **403**）；artifact 下载需 auth（**401**）
 - **`/repos/{o}/{r}/check-runs/{id}/annotations` 匿名可读（200）**
   → 失败路径必须主动 `echo "::error::<行>"` 才能远程取到报错
+- 失败时 workflow 会把 `build.log` 推到 **`ci-diag` 分支**（可匿名 clone）
 - 本机可 `git push`（SSH 已配）；`raw.githubusercontent.com` 不稳，优先用
   api.github.com contents（base64），注意 60 次/小时匿名限流
+
+## 两个必须遵守的硬规则（都踩过坑）
+1. **版本串必须精确等于 `5.10.260-gki-gef362912d37b`**，否则 ROM 现成的
+   vendor 模块全部加载失败（能开机但 Wi-Fi/蓝牙/音频废）。
+   `scripts/setlocalversion` 对脏工作树会追加 `-dirty`，而我们必然要改
+   `gki_defconfig` / `drivers/Makefile` / `drivers/Kconfig`。
+   对策：在**刚 checkout、树还干净时**写 `$WS/common/.scmversion` =
+   `-g$(git rev-parse HEAD | cut -c1-12)`；setlocalversion 会优先读它并直接 return。
+2. **Windows 上写 `.gitignore` 必须逐个 `git check-ignore -v` 验证**：
+   本机 `core.ignorecase=true`，gitignore 匹配不区分大小写。
+   曾因写 `AnyKernel3/` 把仓库里的 `anykernel3/` 一起忽略，导致该文件从未入库、
+   CI 上 `cp` 找不到源文件而静默秒退。**绝不能出现大小写只差的名字。**
+
+## 构建工作区
+源码/JDK 都放 `/mnt/wbkernel/kp`（runner 上 `/mnt` 约 70~86GB 可用，`/` 只有约 14GB），
+所以 `free_disk` 默认 `false`，**不需要清理任何系统目录**。
+注意 `/mnt` 属于 root，要先 `sudo mkdir + chown` 才能写。
