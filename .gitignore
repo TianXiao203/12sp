@@ -28,3 +28,7 @@ build.log
 *.pem
 .env
 remote.py
+
+# Python 字节码
+__pycache__/
+*.pyc
