@@ -97,9 +97,18 @@ on:
         options:
           - 'true'
           - 'false'
+      push_diag_branch:
+        description: '失败时把 build.log 等诊断推到 ci-diag 分支（job log 接口要 admin 权限，匿名拿不到，推分支才能远程排错）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
-  contents: read
+  # 需要 write 才能把诊断推到 ci-diag 分支（仅失败时，可用 push_diag_branch=false 关掉）
+  contents: write
 
 jobs:
   build:
@@ -128,6 +137,37 @@ jobs:
     steps:
       - name: Checkout build kit
         uses: actions/checkout@v4
+
+      - name: 预检：仓库自带脚本/配置是否齐全（1 秒，防止白等 20 分钟）
+        run: |
+          # 为什么要有这一步：
+          # Windows 上 core.ignorecase=true，.gitignore 的匹配也不区分大小写，
+          # 所以 `AnyKernel3/` 曾经把仓库里的 `anykernel3/` 整个忽略掉，
+          # 导致运行时 cp 找不到源文件、脚本静默秒退（Run#4 第 18 步就是这么挂的）。
+          # 这里提前把需要的文件全查一遍，缺了就立刻失败并点名。
+          set -uo pipefail
+          MISS=0
+          need="
+            scripts/apply-configs.sh
+            scripts/integrate-resukisu.sh
+            scripts/preconfig-kernel.sh
+            scripts/assemble-lineage-kernel.sh
+            scripts/pack-anykernel3.sh
+            scripts/verify-built-config.sh
+            configs/docker-cgroup.fragment
+            anykernel3/anykernel.sh
+          "
+          for f in $need; do
+            if [ -f "$GITHUB_WORKSPACE/$f" ]; then
+              printf '  [OK]   %s\n' "$f"
+            else
+              printf '  [MISS] %s\n' "$f"
+              echo "::error title=仓库缺少文件::$f 没有被提交（很可能是 .gitignore 大小写冲突误伤）"
+              MISS=$((MISS+1))
+            fi
+          done
+          echo "  缺失: $MISS"
+          [ "$MISS" -eq 0 ] || exit 1
 
       - name: 选择构建工作区（优先 /mnt，空间最大，因此无需清理系统目录）
         id: pick_ws
@@ -414,41 +454,65 @@ jobs:
           fi
           echo "设备实测 uname -r : $EXPECTED_RELEASE"
           echo "本次构建 release  : ${REL:-<取不到>}"
+          echo "内核树 .scmversion : $(cat "$WS/common/.scmversion" 2>/dev/null || echo '<不存在>')"
+          echo "CONFIG_LOCALVERSION: $(grep -m1 '^CONFIG_LOCALVERSION=' "$WS/out/common/.config" 2>/dev/null || echo '<取不到>')"
           if [ "$REL" = "$EXPECTED_RELEASE" ]; then
-            echo "[OK] 完全一致 -> 只需刷 boot.img / AK3，ROM 里现成的 vendor 模块可直接加载"
+            echo "::notice title=版本串一致:: ${REL}  -> 只需刷 boot.img / AK3，ROM 里现成的 vendor 模块可直接加载"
           else
-            echo "::warning::版本串与设备不一致，刷完可能出现 WiFi/蓝牙/音频失效。"
-            echo "::warning::请确认 kernel_commit 是否为 ef362912d37b761041709638c1e571d6394e9558"
-            echo "::warning::以及内核树里 LOCALVERSION_AUTO / LOCALVERSION 的实际取值"
+            # 用 ::error:: 而不是 ::warning::，并且把【两侧的实际值】都写进注解 ——
+            # 这样即使拿不到 job log（匿名 API 是 403），也能从 annotations 远程读出差异。
+            echo "::error title=版本串不一致::本次构建=[${REL:-<取不到>}]  设备=[$EXPECTED_RELEASE]"
+            echo "::error::本次构建 kernel.release = ${REL:-<取不到>}"
+            echo "::error::设备实测 uname -r      = $EXPECTED_RELEASE"
+            echo "::error::内核查到的 .scmversion = $(cat "$WS/common/.scmversion" 2>/dev/null || echo '<不存在>')"
+            echo "::error::刷这个内核会让 ROM 现成的 vendor 模块加载失败（Wi-Fi/蓝牙/音频废掉），先别刷。"
           fi
 
       - name: 收集产物并打包 AnyKernel3
         run: |
-          set -e
-          IMAGE="$(find "$WS/out" -maxdepth 8 -type f -name 'Image' -print -quit || true)"
+          # 刻意不开 set -e：每一步都显式判错，并把报错发成 ::error:: 注解
+          # （Actions 的 job log 接口要仓库 admin 权限，匿名 403；
+          #   check-runs 的 annotations 匿名可读，所以失败必须发注解）
+          set -uo pipefail
+
+          IMAGE="$(find "$WS/out" -maxdepth 8 -type f -name 'Image' -print -quit 2>/dev/null || true)"
           if [ -z "$IMAGE" ]; then
-            echo "::error::没找到 Image，编译产物不完整"
-            find "$WS/out" -maxdepth 4 -type d | head -40 || true
+            echo "::error title=产物缺失::没找到 Image，编译产物不完整"
+            find "$WS/out" -maxdepth 4 -type d 2>/dev/null | head -40 \
+              | while IFS= read -r l; do printf '::error::%s\n' "$l"; done
             exit 1
           fi
-          echo "[+] Image = $IMAGE"
+          echo "[+] Image = $IMAGE ($(du -h "$IMAGE" | cut -f1))"
 
           mkdir -p "$GITHUB_WORKSPACE/upload" "$GITHUB_WORKSPACE/ak3dist"
           cp -f "$IMAGE" "$GITHUB_WORKSPACE/ak3dist/Image"
           cp -f "$IMAGE" "$GITHUB_WORKSPACE/upload/Image"
 
           for f in boot.img vendor_dlkm.img dtb.img dtbo.img; do
-            SRC="$(find "$WS/out" -maxdepth 6 -type f -name "$f" -print -quit || true)"
+            SRC="$(find "$WS/out" -maxdepth 6 -type f -name "$f" -print -quit 2>/dev/null || true)"
             if [ -n "$SRC" ]; then cp -f "$SRC" "$GITHUB_WORKSPACE/upload/"; echo "  [+] $f"; fi
-          done || true
+          done
 
-          CFG="$(find "$WS/out" -maxdepth 8 -type f -name '.config' -print -quit || true)"
+          CFG="$(find "$WS/out" -maxdepth 8 -type f -name '.config' -print -quit 2>/dev/null || true)"
           if [ -n "$CFG" ]; then cp -f "$CFG" "$GITHUB_WORKSPACE/upload/kernel.config.txt"; fi
           cp -f "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/upload/" 2>/dev/null || true
 
+          echo "== 调用 pack-anykernel3.sh =="
           bash "$GITHUB_WORKSPACE/scripts/pack-anykernel3.sh" \
                "$GITHUB_WORKSPACE/ak3dist" "$GITHUB_WORKSPACE/AnyKernel3" \
-               "$GITHUB_WORKSPACE/upload/anykernel3-unicorn.zip"
+               "$GITHUB_WORKSPACE/upload/anykernel3-unicorn.zip" \
+               2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          rc=${PIPESTATUS[0]}
+          echo "pack-anykernel3.sh 退出码 = $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=AK3 打包失败::pack-anykernel3.sh 退出码 $rc"
+            tail -n 20 "$GITHUB_WORKSPACE/build.log" 2>/dev/null \
+              | while IFS= read -r l; do printf '::error::%s\n' "$l"; done
+            exit "$rc"
+          fi
+
+          echo "== upload/ 内容 =="
+          ls -l "$GITHUB_WORKSPACE/upload/" 2>&1 || true
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -477,6 +541,7 @@ jobs:
           cp -f "$WS"/build.env "$D/" 2>/dev/null
           cp -f "$WS"/common/arch/arm64/configs/gki_defconfig "$D/defconfig/" 2>/dev/null
           cp -f "$WS"/common/arch/arm64/configs/vendor/*.config "$D/defconfig/" 2>/dev/null
+          cp -f "$WS"/common/.scmversion "$D/" 2>/dev/null
           cp -f "$WS"/out/common/.config "$D/out/" 2>/dev/null
           cp -f "$WS"/out/common/include/config/kernel.release "$D/out/" 2>/dev/null
           du -sh "$D" 2>/dev/null
@@ -491,3 +556,41 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: diag/**
+
+      - name: 失败时把完整日志推到 ci-diag 分支（可匿名读取，用于远程排错）
+        if: failure() && inputs.push_diag_branch == 'true'
+        continue-on-error: true
+        run: |
+          # 为什么要推分支：
+          #   Actions 的 job log 接口需要仓库 admin 权限（匿名 403），
+          #   artifact 下载也需要 auth（匿名 401）—— 也就是说，如果只看 API，
+          #   失败原因基本拿不到。而 git 分支是可以匿名 clone 的。
+          #   所以失败时把 build.log + 关键中间产物推到一个独立分支 ci-diag，
+          #   之后就能直接读到完整日志，不用再靠猜或让你手工复制粘贴。
+          set -uo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git config user.name  "kernel-ci"
+          git config user.email "kernel-ci@localhost"
+          mkdir -p diag
+          {
+            echo "run_id=${{ github.run_id }}  attempt=${{ github.run_attempt }}"
+            echo "sha=${{ github.sha }}"
+            echo "ws=$WS"
+            echo
+            echo "== df -h =="; df -h 2>&1
+            echo; echo "== free -h =="; free -h 2>&1
+            echo; echo "== kernel.release =="; cat "$WS/out/common/include/config/kernel.release" 2>&1
+            echo; echo "== .scmversion =="; cat "$WS/common/.scmversion" 2>&1
+            echo; echo "== upload/ =="; ls -la "$GITHUB_WORKSPACE/upload" 2>&1
+            echo; echo "== AnyKernel3 工作目录 =="; ls -la "$GITHUB_WORKSPACE/AnyKernel3" 2>&1 | head -30
+            echo; echo "== 仓库自带文件 =="; ls -la "$GITHUB_WORKSPACE/anykernel3" 2>&1
+          } > diag/summary.txt 2>&1
+          cp -f "$GITHUB_WORKSPACE/build.log" diag/ 2>/dev/null
+          git checkout -B ci-diag
+          git add -f diag
+          git -c user.name=kernel-ci -c user.email=kernel-ci@localhost \
+              commit -m "ci-diag: run ${{ github.run_id }} attempt ${{ github.run_attempt }} (${{ github.sha }})" \
+              || echo "[i] 没有变更可提交"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              ci-diag 2>&1 | tail -5
+          echo "::notice title=诊断已推送:: 分支 ci-diag（含 build.log 与 summary.txt）"

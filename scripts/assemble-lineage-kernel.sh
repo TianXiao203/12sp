@@ -95,9 +95,40 @@ if [ -n "$COMMIT" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1b) 冻结 scm 版本串 -> $WS/common/.scmversion
+#
+# 为什么必须做：
+#   scripts/setlocalversion 第 110~121 行会在【工作树有未提交改动】时追加 -dirty。
+#   而我们要改 gki_defconfig、drivers/Makefile、drivers/Kconfig 并加 KSU 源码，
+#   所以不加处理的话编出来会是：
+#       5.10.260-gki-gef362912d37b-dirty      （设备实际是 ...-gef362912d37b）
+#   vermagic 不一致 -> ROM 里现成的 vendor_dlkm / vendor_boot 模块【全部加载失败】
+#   -> 能开机但 Wi-Fi / 蓝牙 / 音频 / 相机废掉。
+#
+#   同一个脚本第 56~59 行：
+#       if test -e .scmversion; then cat .scmversion; return; fi
+#   —— 只要存在 .scmversion，就直接返回它的内容，后面的 -dirty 判断根本不会执行。
+#   所以这里在【刚 checkout、树还干净】时冻结成 -g<12 位 sha>，
+#   得到的完整版本串就是 5.10.260 + "-gki"(CONFIG_LOCALVERSION) + "-g<sha>"
+#   = 5.10.260-gki-gef362912d37b，与设备完全一致。
+#
+#   另外 sha 取前 12 位：setlocalversion 自己也是这么截的（第 100 行 cut -c1-12），
+#   这样不受 git 版本 / core.abbrev 设置 / 仓库对象数量影响。
+# ---------------------------------------------------------------------------
+SCM_FILE="$WS/common/.scmversion"
+SHORT_SHA="$(cd "$WS/common" && git rev-parse HEAD 2>/dev/null | cut -c1-12)"
+if [ -n "$SHORT_SHA" ]; then
+  printf '%s' "-g$SHORT_SHA" > "$SCM_FILE"
+  echo "[assemble][OK] 已冻结 scm 版本串: $(cat "$SCM_FILE")  ->  $SCM_FILE"
+else
+  warn "取不到 HEAD sha，未能写 .scmversion（版本串可能带 -dirty，会导致 vendor 模块加载失败）"
+fi
+
+# ---------------------------------------------------------------------------
 # 2) 工具链 / 构建脚本 / dtc
 # ---------------------------------------------------------------------------
 echo "[assemble] clang 版本: $CLANG_VER"
+
 if [ ! -x "$CLANG_DIR/bin/clang" ]; then
   clone_repo "https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER" \
              "$CLANG_DIR" "" "--depth=1" || true

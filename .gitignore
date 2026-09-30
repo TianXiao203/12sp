@@ -1,16 +1,28 @@
-# 构建工作区与产物（Node/内核都很大，绝不入库）
+# =============================================================================
+# 注意：这里【绝对不能】再写 `AnyKernel3/` 这类会大小写冲突的模式。
+#
+# 本机 core.ignorecase=true（Windows 的 git 默认值），gitignore 的匹配也因此
+# 不区分大小写 —— 写 `AnyKernel3/` 会把仓库里真正有用的 `anykernel3/`
+# 目录一起忽略掉，结果该文件在 CI 上根本不存在。
+# （曾因此让 Run#4 的第 18 步 1 秒失败：cp $HERE/anykernel3/anykernel.sh 找不到源文件。）
+# 现在仓库自身的 AK3 配置在 anykernel3/（必须入库），
+# 克隆来的上游目录在 /tmp 或工作区外，不需要在这里忽略。
+# =============================================================================
+
+# 构建工作区与产物（内核树 / clang 都很大，绝不入库）
 kp/
+wbkernel/
 out/
 upload/
 ak3dist/
-AnyKernel3/
 build.log
 *.zip
 *.img
 *.tar.gz
 
-# defconfig 备份
+# defconfig 与 .config 备份
 *.orig
+.scmversion
 
 # 凭据永远不要入库
 *.pem

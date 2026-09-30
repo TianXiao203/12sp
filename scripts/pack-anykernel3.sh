@@ -4,70 +4,154 @@
 #
 # 用法:
 #   bash scripts/pack-anykernel3.sh <dist_dir> [ak3_work_dir] [output_zip]
-#     <dist_dir>      编译产物目录，例如 out/msm-kernel-zeus/dist
-#     [ak3_work_dir]  AnyKernel3 工作目录，默认 ./AnyKernel3（不存在会自动 clone）
+#     <dist_dir>      含 Image 的目录
+#     [ak3_work_dir]  AnyKernel3 工作目录，默认 ./AnyKernel3（不存在会自动获取）
+#     [output_zip]    输出 zip 路径
 #
-# 产物: anykernel3-unicorn-<时间戳>.zip
-#   里面【只有】Image，不含 dtb —— 保留原机 DTB / ramdisk，避免 DTS 不匹配。
+# 产物: <output_zip>，里面【只有】Image，不含 dtb
+#       —— 保留原机 DTB / ramdisk，避免 DTS 不匹配。
+#
+# 设计要点（都来自踩过的坑）：
+#  1) anykernel.sh 优先用仓库里的 anykernel3/anykernel.sh；如果它不存在
+#     （例如被 .gitignore 的大小写冲突漏掉、或单脚本被单独拷出来用），
+#     就写一份内嵌兜底版本，绝不因为"找不到源文件"而静默失败。
+#  2) 失败一律用 ::error:: 发注解。Actions 的 job log 接口要仓库 admin 权限
+#     （匿名 403），而 check-runs 的 annotations 匿名可读 —— 只有发注解，
+#     远程才能看到真实报错。
+#  3) 不用 `[ -f x ] && {...}` 作为循环体最后一条命令：在 set -e 下，
+#     循环整体会返回该 AND-OR 列表的失败码，导致脚本莫名其妙地退出。
 # =============================================================================
-set -euo pipefail
+set -uo pipefail
 
 DIST_DIR="${1:-}"
 AK3_DIR="${2:-./AnyKernel3}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+err() { printf '::error::pack-anykernel3: %s\n' "$*" >&2; }
+log() { printf '%s\n' "$*"; }
+
 if [ -z "$DIST_DIR" ] || [ ! -d "$DIST_DIR" ]; then
-  echo "用法: bash $0 <dist_dir> [ak3_work_dir]" >&2
-  exit 1
+  err "dist_dir 无效: '$DIST_DIR'（用法: bash $0 <dist_dir> [ak3_work_dir] [output_zip]）"
+  exit 2
 fi
 
 # --- 1) 找 Image -------------------------------------------------------------
 IMAGE=""
-for cand in "$DIST_DIR/Image" "$DIST_DIR/kernel" ; do
-  [ -f "$cand" ] && { IMAGE="$cand"; break; }
-done
-if [ -z "$IMAGE" ]; then
+if [ -f "$DIST_DIR/Image" ]; then
+  IMAGE="$DIST_DIR/Image"
+elif [ -f "$DIST_DIR/kernel" ]; then
+  IMAGE="$DIST_DIR/kernel"
+else
   IMAGE="$(find "$DIST_DIR" -maxdepth 2 -type f -name 'Image' -print -quit 2>/dev/null || true)"
 fi
 if [ -z "$IMAGE" ]; then
-  echo "[ERROR] 在 $DIST_DIR 里找不到 Image。目录内容：" >&2
-  ls -lh "$DIST_DIR" >&2 || true
-  echo "提示：内核镜像也可能在 out/msm-kernel-<target>/arch/arm64/boot/Image" >&2
+  err "在 $DIST_DIR 里找不到 Image。目录内容："
+  ls -lh "$DIST_DIR" 2>&1 | head -30 | while IFS= read -r l; do err "$l"; done
   exit 1
 fi
-echo "[+] 内核镜像: $IMAGE ($(du -h "$IMAGE" | cut -f1))"
+log "[+] 内核镜像: $IMAGE ($(du -h "$IMAGE" | cut -f1))"
 
 # --- 2) 准备 AnyKernel3 ------------------------------------------------------
-if [ ! -d "$AK3_DIR/tools" ]; then
-  echo "[+] 克隆 AnyKernel3 ..."
-  git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_DIR"
+if [ ! -f "$AK3_DIR/tools/ak3-core.sh" ]; then
+  log "[+] 获取 AnyKernel3 -> $AK3_DIR"
+  rm -rf "$AK3_DIR"
+  if git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_DIR"; then
+    log "[+] git clone 成功"
+  else
+    log "[WARN] git clone 失败，改用 codeload tarball"
+    rm -rf "$AK3_DIR" /tmp/ak3.tar.gz
+    mkdir -p "$AK3_DIR"
+    if curl -fsSL --retry 3 -o /tmp/ak3.tar.gz \
+         https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master; then
+      tar xzf /tmp/ak3.tar.gz -C "$AK3_DIR" --strip-components=1 || true
+      log "[+] tarball 解包完成"
+    fi
+  fi
 fi
-[ -f "$AK3_DIR/tools/ak3-core.sh" ] || { echo "[ERROR] $AK3_DIR 不是合法的 AnyKernel3 目录" >&2; exit 1; }
+if [ ! -f "$AK3_DIR/tools/ak3-core.sh" ]; then
+  err "AnyKernel3 获取失败（git clone 与 curl 都失败），无法打包"
+  ls -la "$AK3_DIR" 2>&1 | head -20 | while IFS= read -r l; do err "$l"; done
+  exit 1
+fi
+log "[+] AnyKernel3 就绪: $AK3_DIR"
 
 # --- 3) 清理：不要 dtb / modules / 旧 Image ---------------------------------
-rm -f  "$AK3_DIR/dtb" "$AK3_DIR/Image" "$AK3_DIR/Image.gz" "$AK3_DIR/zImage" "$AK3_DIR/kernel"
-rm -rf "$AK3_DIR/modules"
-rm -rf "$AK3_DIR/ramdisk" "$AK3_DIR/split_img" "$AK3_DIR/rdtmp"
+rm -f "$AK3_DIR/dtb" "$AK3_DIR/Image" "$AK3_DIR/Image.gz" "$AK3_DIR/zImage" "$AK3_DIR/kernel"
+rm -rf "$AK3_DIR/modules" "$AK3_DIR/ramdisk" "$AK3_DIR/split_img" "$AK3_DIR/rdtmp"
 
-cp -f "$IMAGE" "$AK3_DIR/Image"
-cp -f "$HERE/anykernel3/anykernel.sh" "$AK3_DIR/anykernel.sh"
+cp -f "$IMAGE" "$AK3_DIR/Image" || { err "复制 Image 到 $AK3_DIR 失败"; exit 1; }
 
-# --- 4) 打包 ----------------------------------------------------------------
+# --- 4) anykernel.sh：优先仓库版本，缺失则内嵌兜底 ---------------------------
+AK3_SH_REPO="$HERE/anykernel3/anykernel.sh"
+if [ -f "$AK3_SH_REPO" ]; then
+  cp -f "$AK3_SH_REPO" "$AK3_DIR/anykernel.sh" || { err "复制 $AK3_SH_REPO 失败"; exit 1; }
+  log "[+] anykernel.sh 来自仓库: $AK3_SH_REPO"
+else
+  log "[WARN] 仓库里没有 $AK3_SH_REPO，改用内嵌兜底版本"
+  cat > "$AK3_DIR/anykernel.sh" <<'AK3EOF'
+### AnyKernel3 Ramdisk Mod Script (内嵌兜底版本)
+## 只替换 kernel Image，保留原机 DTB 与 ramdisk。
+
+properties() { '
+kernel.string=Unicorn 5.10 GKI + ReSukiSU + Docker cgroups
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=unicorn
+device.name2=
+device.name3=
+device.name4=
+device.name5=
+supported.versions=
+supported.patchlevels=
+supported.vendorpatchlevels=
+'; } # end properties
+
+block=boot
+is_slot_device=auto
+ramdisk_compression=auto
+patch_vbmeta_flag=auto
+
+. tools/ak3-core.sh;
+
+dump_boot;
+write_boot;
+## end install
+AK3EOF
+fi
+[ -s "$AK3_DIR/anykernel.sh" ] || { err "$AK3_DIR/anykernel.sh 为空"; exit 1; }
+
+# --- 5) 打包 -----------------------------------------------------------------
+if ! command -v zip >/dev/null 2>&1; then
+  err "系统里没有 zip（ubuntu: apt-get install -y zip）"
+  exit 1
+fi
+
 OUT_ZIP="${3:-$HERE/anykernel3-unicorn-$(date +%Y%m%d-%H%M).zip}"
-OUT_ZIP="$(cd "$(dirname "$OUT_ZIP")" && pwd)/$(basename "$OUT_ZIP")"
+OUT_DIR="$(dirname "$OUT_ZIP")"
+mkdir -p "$OUT_DIR" || { err "创建 $OUT_DIR 失败"; exit 1; }
+OUT_ZIP="$(cd "$OUT_DIR" && pwd)/$(basename "$OUT_ZIP")"
+rm -f "$OUT_ZIP"
 
-( cd "$AK3_DIR" && rm -f "$OUT_ZIP" && zip -r9 "$OUT_ZIP" . -x '.git/*' '.git*' '*.zip' > /dev/null )
+( cd "$AK3_DIR" && zip -r9 "$OUT_ZIP" . -x '.git/*' '.git*' '*.zip' ) >/dev/null 2>&1
+if [ ! -s "$OUT_ZIP" ]; then
+  err "zip 打包失败，$OUT_ZIP 不存在或为空"
+  exit 1
+fi
 
-echo
-echo "[+] 已生成: $OUT_ZIP"
-echo "[i] 包含内容:"
+log ""
+log "[+] 已生成: $OUT_ZIP ($(du -h "$OUT_ZIP" | cut -f1))"
+log "[i] 包含内容:"
 ( cd "$AK3_DIR" && unzip -l "$OUT_ZIP" 2>/dev/null | sed -n '4,14p' ) || true
-echo
-echo "刷入方式（三选一）："
-echo "  1) Recovery:  adb sideload $OUT_ZIP"
-echo "  2) TWRP:      直接安装该 zip"
-echo "  3) ReSukiSU / 内核管理器 App 里的 '刷入' 功能选择该 zip"
-echo
-echo "刷前请务必备份原 boot："
-echo "  adb shell su -c 'dd if=/dev/block/by-name/boot_a of=/sdcard/boot_stock.img'"
-echo "  adb pull /sdcard/boot_stock.img"
+log ""
+log "刷入方式（三选一）："
+log "  1) Recovery:  adb sideload $OUT_ZIP"
+log "  2) TWRP:      直接安装该 zip"
+log "  3) ReSukiSU / 内核管理器 App 里的 '刷入' 功能选择该 zip"
+log ""
+log "刷前请务必备份原 boot（当前 slot，实测 _b）："
+log "  adb shell su -c 'dd if=/dev/block/by-name/boot_b of=/sdcard/boot_stock.img'"
+log "  adb pull /sdcard/boot_stock.img"
+exit 0
