@@ -9,7 +9,7 @@
 #   FRAGMENT=all|ns|cgroup|none
 #   DEBUG_INFO=on|off 默认 off（16GB runner 的 FULL LTO OOM 对策）
 #
-# --- bisect E2：FRAGMENT=none + KSU=on + DEBUG off ---
-KSU=on
-FRAGMENT=none
+# --- bisect F2：FRAGMENT=ns + KSU=off + DEBUG off ---
+KSU=off
+FRAGMENT=ns
 DEBUG_INFO=off
