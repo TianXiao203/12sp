@@ -468,6 +468,52 @@ ROOT_DIR=$PWD KERNEL_DIR=$PWD/common BUILD_CONFIG=common/build.config.msm.waipio
 
 ## 6. 刷入：只刷 boot.img 就够（含为什么）
 
+### 6.0 产物里为什么没有 boot.img？想直接刷镜像怎么办？
+
+**CI 的产物只有裸内核 `Image`，没有 `boot.img`** —— 这是刻意的：我们只做
+`make Image`（AK3 只需要它，省掉 modules/dtbs 的编译时间）。
+
+`Image` **不能**直接刷进分区。一个可刷的 Android boot 镜像 =
+`头部(header) + 内核(kernel) + ramdisk + cmdline + dtb`，其中
+**ramdisk 必须来自你的 ROM**（里面有 init、fstab 等），不可能凭空造。
+所以只有两条路：
+
+**路 A（推荐）：让 AnyKernel3 现场打镜像**
+
+AK3 做的事情本质就是：读**当前**的 boot 分区 → 拆出 ramdisk → 换成我们的
+`Image` → 重新打包 → 写回去。也就是说，"刷 zip" 和 "刷 boot.img"
+在这里是同一个操作，而且它用的是**当前**的 ramdisk、最准确。
+
+```sh
+# 手机上直接刷（用任意支持 AK3 的刷机 App / 内核管理器选择该 zip）
+/sdcard/Download/anykernel3-unicorn-fixed.zip
+```
+
+**路 B：先生成一个 `.img`，再用 `fastboot flash boot` 或 App 的"刷入镜像"**
+
+用 `scripts/make-bootimg-via-adb.sh`：它在**手机上**调用 AK3 自带的
+`magiskboot` 完成 unpack → 换 kernel → repack，全程不用在 Windows 上找交叉工具。
+
+```sh
+bash scripts/make-bootimg-via-adb.sh \
+     anykernel3-unicorn-fixed.zip        # 内含 Image 与 tools/magiskboot
+# 输出: boot-unicorn-custom.img（PC 与 /sdcard 各一份）
+```
+
+但它需要一个**现成的 boot 镜像当底**（提供 ramdisk 与头部）。最准的底是
+**当前** boot 分区的 dump —— 在 ReSukiSU 管理器的 **root 终端**里执行：
+
+```sh
+dd if=/dev/block/by-name/boot_b of=/sdcard/boot_b_current.img bs=1M
+```
+
+> 说明：`adb shell` 里 **没有 `su`**（ReSukiSU 的 su 不对 adb shell 暴露，
+> 实测报 `su: inaccessible or not found`），所以这条 dd 我代跑不了，
+> 得你在管理器自带终端里跑一次。
+> 脚本会按 `/sdcard/boot_b_current.img` → `/sdcard/boot.img` 的顺序自动挑底。
+
+重打包后 AVB 签名失效；你设备已解锁（`verifiedbootstate=orange`），通常可直接刷。
+
 ### 6.1 先做版本串比对（决定你要不要多刷东西）
 
 你这台设备的目标版本串已经实测确定：**`5.10.260-gki-gef362912d37b`**。
@@ -641,6 +687,7 @@ scripts/assemble-lineage-kernel.sh         路径 B：组装编译工作区（�
 scripts/verify-built-config.sh             编译后核对 .config 并比对 kernelrelease
 scripts/pack-anykernel3.sh                 生成只换 kernel 的 AnyKernel3 包（含 anykernel.sh 自检）
 scripts/patch-ak3-zip.py                   就地替换已有 AK3 zip 里的 anykernel.sh（免重编）
+scripts/make-bootimg-via-adb.sh            在手机上用 magiskboot 把 Image 打成可刷的 boot.img
 scripts/device-verify.sh                   手机上一键验证（只读）
 anykernel3/anykernel.sh                    AnyKernel3 配置（device.name1=unicorn）
 .github/workflows/build-unicorn-kernel.yml GitHub Actions 构建工作流

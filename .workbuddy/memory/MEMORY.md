@@ -83,6 +83,17 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
 内核 Image 已经在内核 zip 里、只是脚本有问题时，不必重跑 16 分钟编译：
 `python scripts/patch-ak3-zip.py <原zip> anykernel3/anykernel.sh [输出zip]`
 
+## 交付物形态
+CI 产物【只有裸内核 `Image`】，没有 `boot.img`（刻意只做 `make Image`）。
+`Image` 不能直接刷分区 —— 可刷 boot 镜像需要 ramdisk，而 ramdisk 只能来自 ROM。
+要 `.img` 就用 `scripts/make-bootimg-via-adb.sh`（在手机上用 magiskboot 打），
+需要一个现成 boot 镜像当底（当前 boot 分区的 dump 最准）。
+**`adb shell` 里没有 su**，dump boot 分区得用 ReSukiSU 管理器的 root 终端。
+
+## AK3 工具链架构
+AK3 master 的 `tools/*` 是 **32 位 ARM** 静态二进制；设备 `CONFIG_COMPAT=y`，
+所以能在手机上跑，不必换包。（`tools/$arch32` 子目录并不存在。）
+
 ## 提交状态（2026-10-01）
 `origin/main` = `178a3c7`；Run#5（sha `02ae2a7`）已全绿，
 版本串 `5.10.260-gki-gef362912d37b` 与设备逐字一致。
