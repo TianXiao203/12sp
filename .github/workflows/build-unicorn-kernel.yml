@@ -23,6 +23,7 @@ on:
     paths:
       - 'configs/**'
       - 'scripts/**'
+      - 'ci/**'
       - 'anykernel3/**'
       - 'abi-baseline/abi-crcs.txt'
       - '.github/workflows/build-unicorn-kernel.yml'
