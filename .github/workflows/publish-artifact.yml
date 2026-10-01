@@ -1,0 +1,98 @@
+name: Publish existing artifact to branch
+
+# 用途：把【已经跑完的 run】的产物搬到 ci-artifacts 分支上。
+#
+# 为什么需要它：
+#   GitHub 的 artifact 下载接口需要鉴权（匿名 401），只能人在网页上点下载；
+#   而 job log 接口需要 admin（匿名 403）。只有 git 分支能匿名 clone。
+#   所以：一旦某个 run 已经成功产出 AK3 包，就用这个小 workflow 把包转到分支，
+#   之后本机 `git clone --branch ci-artifacts` 就能直接拿到，不用重编内核
+#   （重编一次要 ~20 分钟，而这一步只要 ~1 分钟）。
+#
+# 用法：Actions -> 左侧选 "Publish existing artifact to branch" -> Run workflow
+#       run_id 留默认（已填好最近一次成功构建的 id），直接点绿色的按钮。
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要发布的 run id（Run#6 = 36808820905，改这里可发布别的 run）'
+        required: true
+        default: '36808820905'
+      artifact_name:
+        description: '产物名（构建工作流里 upload-artifact 的 name）'
+        required: true
+        default: 'unicorn-lineage-kernel-resukisu-docker-cgroup'
+      target_branch:
+        description: '发布到哪个分支'
+        required: true
+        default: 'ci-artifacts'
+
+permissions:
+  contents: write   # 推分支
+  actions: read     # 跨 run 下载 artifact 必需
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载指定 run 的产物
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          name: ${{ inputs.artifact_name }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 查看下载到的东西
+        run: |
+          echo "== 文件清单 =="
+          find . -type f -printf '%10s  %p\n' | sort -rn | head -30
+
+      - name: 推到目标分支
+        run: |
+          set -uo pipefail
+          BR="${{ inputs.target_branch }}"
+          mkdir -p art
+          # 构建工作流的 artifact 结构是 upload/** + build.log
+          ZIP="$(find . -maxdepth 3 -name 'anykernel3-unicorn.zip' -print -quit)"
+          [ -n "$ZIP" ] || ZIP="$(find . -maxdepth 3 -name '*.zip' -print -quit)"
+          if [ -z "$ZIP" ]; then
+            echo "::error title=没找到 zip::这个 run 的产物里没有 AK3 包，检查 run_id 是否正确"
+            find . -maxdepth 3 -type f | head -20
+            exit 1
+          fi
+          echo "[+] 取到: $ZIP ($(stat -c %s "$ZIP") bytes)"
+          cp -f "$ZIP" art/anykernel3-unicorn.zip
+          cp -f upload/kernel.config.txt art/ 2>/dev/null || true
+          cp -f build.log art/ 2>/dev/null || true
+          {
+            echo "source_run_id=${{ inputs.run_id }}"
+            echo "source_artifact=${{ inputs.artifact_name }}"
+            echo "zip_bytes=$(stat -c %s art/anykernel3-unicorn.zip)"
+            echo "zip_sha256=$(sha256sum art/anykernel3-unicorn.zip | cut -d' ' -f1)"
+            echo "kernel.string=$(unzip -p art/anykernel3-unicorn.zip anykernel.sh 2>/dev/null | grep -m1 'kernel.string' || echo '<取不到>')"
+            echo "anykernel_vars:"
+            unzip -p art/anykernel3-unicorn.zip anykernel.sh 2>/dev/null \
+              | grep -E '^(BLOCK|IS_SLOT_DEVICE|RAMDISK_COMPRESSION|PATCH_VBMETA_FLAG|block|is_slot_device)=' \
+              | sed 's/^/  /' || true
+            echo "image_bytes=$(unzip -l art/anykernel3-unicorn.zip 2>/dev/null | awk '/ Image$/{print $1}')"
+          } > art/INFO.txt
+          cat art/INFO.txt
+
+          git init -q .
+          git config user.name  "kernel-ci"
+          git config user.email "kernel-ci@localhost"
+          git add -f art
+          git -c user.name=kernel-ci -c user.email=kernel-ci@localhost \
+              commit -q -m "ci-artifacts: from run ${{ inputs.run_id }}"
+          git branch -M "$BR"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              "$BR" 2>&1 | tail -5
+          echo "::notice title=已发布:: 分支 $BR/art/anykernel3-unicorn.zip（可匿名 clone）"
+
+      - name: 收尾摘要
+        if: always()
+        run: |
+          echo "在本地用这条命令取包："
+          echo "  git clone --depth=1 --branch ${{ inputs.target_branch }} \\"
+          echo "    https://github.com/${{ github.repository }}.git ci-art"
