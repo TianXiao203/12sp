@@ -11,8 +11,9 @@
 #  2) 稳定性：build.sh 内部的 merge_defconfig_fragments 有两处快速 exit 1：
 #        "ERROR! Detected overridden config!"        （碎片覆盖了 base 里的非默认值）
 #        "ERROR! Treating config warnings as errors" （kconfig 有 warning）
-#  3) LTO：官方 gki_defconfig 是 FULL LTO，16GB runner 上链接阶段几乎必然 OOM。
-#     这里通过追加一个“最后的碎片”把它改成 THIN。
+#  3) LTO：默认保持官方/设备的 FULL LTO（append 一个“最后的碎片”显式钉住），
+#     与设备上唯一"能启动"的那个内核一致。若 runner 内存不足导致 LTO 链接
+#     被 OOM 杀掉，可用第 3 个参数（或 LTO_MODE 环境变量）传 thin 兜底。
 #     注意：绝不能像以前那样用 `scripts/config -e THINLTO` —— 本内核树里
 #     【没有 CONFIG_THINLTO 这个符号】，只有 LTO_CLANG_THIN / LTO_CLANG_FULL，
 #     未知符号会让 scripts/config 退出非零，配合 set -e 直接让整步失败。
@@ -32,6 +33,12 @@ set -uo pipefail
 
 WS="${1:-}"
 OUT="${2:-}"
+# 第 3 个参数（或环境变量 LTO_MODE）: full | thin，默认 full（与设备上能启动的内核一致）
+LTO_MODE="${3:-${LTO_MODE:-full}}"
+case "$LTO_MODE" in
+  full|thin) ;;
+  *) echo "[preconfig] LTO_MODE 只能是 full 或 thin（收到 '$LTO_MODE'）" >&2; exit 2 ;;
+esac
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n=== %s ===\n' "$*"; }
@@ -138,19 +145,34 @@ fi
 
 # ---- 3) 生成 thin-LTO 覆盖碎片（放在最后一个，覆盖 gki_defconfig 的 FULL）---
 step "2. 生成 thin-LTO 覆盖碎片"
-LTOFRAG_REL="arch/arm64/configs/vendor/zz-docker-thinlto.config"
-cat > "$K/$LTOFRAG_REL" <<'EOF'
-# 由 scripts/preconfig-kernel.sh 生成。
-# 官方 gki_defconfig 用的是 Full LTO；16GB / 4 核 runner 上链接阶段极易 OOM，
-# 这里覆盖成 ThinLTO。
-# 注意：本内核树里只有 LTO_CLANG_THIN / LTO_CLANG_FULL 两个 choice 成员，
-#       并【没有】名为 THINLTO 的符号（用 scripts/config -e THINLTO 会失败）。
-CONFIG_LTO=y
+# LTO 模式：默认跟官方一致用 FULL。
+#   实测依据：设备上"能启动"的那个内核（第三方 ReSukiSU 包）是
+#   CONFIG_LTO_CLANG_FULL=y，而我们之前为了省内存改成了 THIN —— 刷进去会卡米标，
+#   所以现在默认回退到 FULL，与已知能启动的构建一模一样。
+#   如果 runner 内存不够导致 LTO 链接被 OOM 杀掉，可以用 --lto=thin 换回来
+#   （代价是与官方不一致，可能有问题）。
+LTOFRAG_REL="arch/arm64/configs/vendor/zz-lto.config"
+if [ "$LTO_MODE" = "thin" ]; then
+  LTO_BODY='CONFIG_LTO=y
 CONFIG_LTO_CLANG=y
 CONFIG_LTO_CLANG_THIN=y
 # CONFIG_LTO_CLANG_FULL is not set
-# CONFIG_LTO_NONE is not set
-EOF
+# CONFIG_LTO_NONE is not set'
+  say "[i] LTO 模式 = THIN（与官方不同，仅用于内存不足时兜底）"
+else
+  LTO_BODY='CONFIG_LTO=y
+CONFIG_LTO_CLANG=y
+CONFIG_LTO_CLANG_FULL=y
+# CONFIG_LTO_CLANG_THIN is not set
+# CONFIG_LTO_NONE is not set'
+  say "[i] LTO 模式 = FULL（与设备上能启动的内核一致）"
+fi
+{
+  echo "# 由 scripts/preconfig-kernel.sh 生成（LTO_MODE=$LTO_MODE）。"
+  echo "# 本内核树里只有 LTO_CLANG_THIN / LTO_CLANG_FULL 两个 choice 成员，"
+  echo "# 并【没有】名为 THINLTO 的符号（用 scripts/config -e THINLTO 会直接失败）。"
+  printf '%s\n' "$LTO_BODY"
+} > "$K/$LTOFRAG_REL"
 say "[+] $K/$LTOFRAG_REL"
 sed 's/^/    /' "$K/$LTOFRAG_REL"
 
@@ -268,8 +290,12 @@ for k in NF_TABLES NF_TABLES_BRIDGE SYSVIPC; do
     FAIL=$((FAIL+1))
   fi
 done
-if ! grep -q "^CONFIG_LTO_CLANG_THIN=y$" "$OUT_ABS/.config"; then
-  say "  [WARN] LTO 不是 thin（若 clang 缺失会这样），Full LTO 在 16GB runner 上有 OOM 风险"
+WANT_LTO=$([ "$LTO_MODE" = "thin" ] && echo LTO_CLANG_THIN || echo LTO_CLANG_FULL)
+if ! grep -q "^CONFIG_${WANT_LTO}=y$" "$OUT_ABS/.config"; then
+  say "  [FAIL] LTO 不是 $WANT_LTO（期望 LTO_MODE=$LTO_MODE）"
+  FAIL=$((FAIL+1))
+else
+  say "  [OK]   LTO = $WANT_LTO（LTO_MODE=$LTO_MODE）"
 fi
 say "  ------------------------------"
 say "  自检失败项: $FAIL"

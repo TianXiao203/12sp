@@ -63,6 +63,14 @@ on:
         options:
           - gki
           - consolidate
+      lto:
+        description: 'LTO 模式。必须与设备上能启动的内核一致（实测 FULL）；thin 只在 runner 内存不足、LTO 链接被 OOM 杀掉时兜底'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - thin
       resukisu_branch:
         description: 'ReSukiSU 分支/标签/commit'
         required: true
@@ -138,6 +146,7 @@ jobs:
       IN_CLANG: ${{ inputs.clang_version || 'clang-r563880c' }}
       IN_DEVICE: ${{ inputs.device || 'unicorn' }}
       IN_VARIANT: ${{ inputs.variant || 'gki' }}
+      IN_LTO: ${{ inputs.lto || 'full' }}
       IN_KSU_BRANCH: ${{ inputs.resukisu_branch || 'main' }}
       IN_KSU_HOOK: ${{ inputs.resukisu_hook || 'kprobes' }}
       IN_ENABLE_SUSFS: ${{ inputs.enable_susfs || 'false' }}
@@ -284,7 +293,7 @@ jobs:
         uses: actions/cache@v4
         with:
           # key 里带 commit：换了 commit 就不会复用旧树（否则版本串/vendor 模块会对不上）
-          key: sm8450-${{ inputs.lineage_branch }}-${{ inputs.kernel_commit }}-${{ inputs.clang_version }}-v1
+          key: sm8450-${{ inputs.lineage_branch || 'lineage-23.2' }}-${{ inputs.kernel_commit || 'ef362912d37b761041709638c1e571d6394e9558' }}-${{ inputs.clang_version || 'clang-r563880c' }}-v1
           path: |
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
@@ -300,7 +309,7 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          key: sm8450-${{ inputs.lineage_branch }}-${{ inputs.kernel_commit }}-${{ inputs.clang_version }}-v1
+          key: sm8450-${{ inputs.lineage_branch || 'lineage-23.2' }}-${{ inputs.kernel_commit || 'ef362912d37b761041709638c1e571d6394e9558' }}-${{ inputs.clang_version || 'clang-r563880c' }}-v1
           path: |
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
@@ -371,7 +380,7 @@ jobs:
           #    而 check-runs 的 annotations 是匿名可读的，这样失败原因才拿得到。
           set -uo pipefail
           export PRECONFIG_LOG="$GITHUB_WORKSPACE/build.log"
-          bash "$GITHUB_WORKSPACE/scripts/preconfig-kernel.sh" "$WS" "$WS/out/common"
+          bash "$GITHUB_WORKSPACE/scripts/preconfig-kernel.sh" "$WS" "$WS/out/common" "$IN_LTO"
           rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::error title=preconfig 失败::退出码 $rc（细节见上方 ::error:: 注解与 build.log 产物）"
@@ -539,14 +548,30 @@ jobs:
           CFG="$(find "$WS/out" -maxdepth 8 -type f -name '.config' -print -quit 2>/dev/null || true)"
           if [ -n "$CFG" ]; then cp -f "$CFG" "$GITHUB_WORKSPACE/upload/kernel.config.txt"; fi
 
-          # ABI 预检要用：内核为每个导出符号算出的 CRC，全在这个文件里。
-          # 有了它才能和 ROM 里 vendor 模块的期望值比对（见下面的 "ABI 预检" 步骤）。
+          # ABI 预检要用：内核为每个导出符号算出的 CRC。
+          # 两条路，按可靠性依次尝试：
+          #   1) Module.symvers —— 但只编 Image 时 modpost 不产出它（实测不存在）；
+          #   2) 从 vmlinux（ELF，节表齐全）里解析 __ksymtab/__kcrctab。
+          #      vmlinux 一定存在（Image 就是从它来的）。
           SYMV="$(find "$WS/out" -maxdepth 4 -type f -name 'Module.symvers' -print -quit || true)"
           if [ -n "$SYMV" ]; then
             cp -f "$SYMV" "$GITHUB_WORKSPACE/upload/kernel.Module.symvers"
-            echo "[+] Module.symvers 已收集: $SYMV ($(wc -l < "$SYMV") 个导出符号)"
+            echo "[+] Module.symvers 已收集: $SYMV ($(wc -l < "$SYMV") 行)"
           else
-            echo "::warning title=缺 Module.symvers::没找到 Module.symvers，ABI 预检会跳过"
+            echo "[i] 没有 Module.symvers（只编 Image 时不产出），改从 vmlinux 解析符号 CRC"
+            VMLINUX="$(find "$WS/out" -maxdepth 4 -type f -name 'vmlinux' -print -quit || true)"
+            if [ -n "$VMLINUX" ]; then
+              echo "[i] vmlinux = $VMLINUX  ($(du -h "$VMLINUX" | cut -f1))"
+              if python3 "$GITHUB_WORKSPACE/scripts/check-abi-crc.py" dump-vmlinux "$VMLINUX" \
+                   -o "$GITHUB_WORKSPACE/upload/kernel.Module.symvers" 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"; then
+                echo "[+] 已从 vmlinux 导出 $(wc -l < "$GITHUB_WORKSPACE/upload/kernel.Module.symvers") 个符号的 CRC"
+              else
+                rm -f "$GITHUB_WORKSPACE/upload/kernel.Module.symvers"
+                echo "::warning title=vmlinux 解析失败::ABI 预检将无法执行（见 job 输出）"
+              fi
+            else
+              echo "::warning title=缺 vmlinux::ABI 预检将无法执行"
+            fi
           fi
           cp -f "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/upload/" 2>/dev/null || true
 
@@ -603,9 +628,10 @@ jobs:
           {
             echo "run_id=${{ github.run_id }}"
             echo "sha=${{ github.sha }}"
-            echo "branch=${{ inputs.lineage_branch }}"
-            echo "kernel_commit=${{ inputs.kernel_commit }}"
-            echo "clang_version=${{ inputs.clang_version }}"
+            echo "branch=$IN_BRANCH"
+            echo "kernel_commit=$IN_COMMIT"
+            echo "clang_version=$IN_CLANG"
+            echo "lto=$IN_LTO"
             echo "kernel.release=$(cat "$WS/out/common/include/config/kernel.release" 2>/dev/null)"
             echo "scmversion=$(cat "$WS/common/.scmversion" 2>/dev/null)"
             echo "zip_bytes=$(stat -c %s art/anykernel3-unicorn.zip 2>/dev/null)"
@@ -643,7 +669,7 @@ jobs:
             exit 0
           fi
           if [ ! -f "$SYMV" ]; then
-            echo "::error title=ABI 预检无法执行::没找到 $SYMV"
+            echo "::error title=ABI 预检无法执行::没找到 $SYMV（既没用 Module.symvers，也没能从 vmlinux 解析出符号 CRC）—— 这属于工具失效，不代表 ABI 有问题，但**先别刷**，先修工具"
             exit 1
           fi
           set +e

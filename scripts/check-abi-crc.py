@@ -26,6 +26,7 @@
 # =============================================================================
 import argparse
 import os
+import re
 import struct
 import sys
 
@@ -143,6 +144,142 @@ def cmd_baseline(args):
     return 0
 
 
+def cmd_dump_vmlinux(args):
+    """从 vmlinux（ELF）里导出"符号 -> CRC"表，输出 Module.symvers 同款格式。
+
+    为什么要从 vmlinux 取，而不是 Module.symvers：
+      我们只跑 `make Image`（不编 modules），而 Module.symvers 是 modpost 在为模块
+      生成符号版本信息时才产出的 —— 实测只编 Image 时它不存在。但 vmlinux 一定
+      存在（Image 就是从它来的），而且 vmlinux 是【完成链接的 ELF】，
+      节表齐全、PREL32 已定值，可以直接定位 __ksymtab / __kcrctab。
+
+    原理（5.10 + CONFIG_MODVERSIONS + CONFIG_HAVE_ARCH_PREL32_RELOCATIONS）：
+      - `struct kernel_symbol` = 3 个 int32（value_offset / name_offset /
+        namespace_offset），偏移都是相对本项自身地址的 PREL32。
+      - 每个导出符号会在 `___kcrctab<sec>+<sym>` 放一个 .long __crc_<sym>；
+        链接脚本用 KEEP(*(SORT(___kcrctab+*))) 收集，和 __ksymtab 一样按名字排序
+        —— 所以两张表是【同序平行数组】，可按索引配对。
+      - MODULE_NAME_LEN 之类的细节不影响这里。
+
+    安全性：只接受名字地址落在 __ksymtab_strings* 节内、且形如 C 标识符的条目，
+    避免把垃圾 PREL32 值误当成符号名。
+    """
+    path = args.vmlinux
+    f = open(path, 'rb')
+    hdr = f.read(64)
+    if hdr[:4] != b'\x7fELF':
+        print('[FAIL] %s 不是 ELF' % path, file=sys.stderr)
+        return 2
+    if hdr[4] != 2 or hdr[5] != 1:
+        print('[FAIL] 只支持 64 位小端 ELF', file=sys.stderr)
+        return 2
+    e_shoff = struct.unpack_from('<Q', hdr, 0x28)[0]
+    e_shentsize = struct.unpack_from('<H', hdr, 0x3A)[0]
+    e_shnum = struct.unpack_from('<H', hdr, 0x3C)[0]
+    e_shstrndx = struct.unpack_from('<H', hdr, 0x3E)[0]
+
+    f.seek(e_shoff)
+    raw = f.read(e_shentsize * e_shnum)
+
+    def sh(i):
+        off = i * e_shentsize
+        return struct.unpack_from('<IIQQQQ', raw, off)   # name,type,flags,addr,offset,size
+
+    _n, _t, _fl, str_addr, str_off, str_size = sh(e_shstrndx)
+    f.seek(str_off)
+    strtab = f.read(str_size)
+
+    def sname(o):
+        e = strtab.find(b'\0', o)
+        return strtab[o:e].decode('utf-8', 'replace')
+
+    secs = {}
+    for i in range(e_shnum):
+        n, t, fl, a, o, sz = sh(i)
+        secs[sname(n)] = (a, o, sz)
+
+    print('[i] 节数 %d；找到 __ksymtab? %s  __kcrctab? %s  __ksymtab_strings? %s'
+          % (e_shnum, '__ksymtab' in secs, '__kcrctab' in secs,
+             '__ksymtab_strings' in secs))
+
+    # 允许把名字地址映射回文件偏移的"容器"：所有带地址的节
+    ranges = [(a, sz, o) for (a, o, sz) in secs.values() if a and sz]
+    # 名字必须落在 __ksymtab_strings*（最严格、最安全）
+    name_ranges = [(a, sz, o) for nm, (a, o, sz) in secs.items()
+                   if nm.startswith('__ksymtab_strings') and sz]
+
+    def in_ranges(addr, rs):
+        for a, sz, o in rs:
+            if a <= addr < a + sz:
+                return o + (addr - a)
+        return None
+
+    def read_cstr(off, maxlen=256):
+        f.seek(off)
+        b = f.read(maxlen)
+        return b.split(b'\0', 1)[0].decode('utf-8', 'replace')
+
+    pat = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*$')
+    pairs = [('__ksymtab', '__kcrctab'),
+             ('__ksymtab_gpl', '__kcrctab_gpl'),
+             ('__ksymtab_gpl_future', '__kcrctab_gpl_future'),
+             ('__ksymtab_unused', '__kcrctab_unused'),
+             ('__ksymtab_unused_gpl', '__kcrctab_unused_gpl')]
+
+    out = {}
+    layouts = [('PREL32(3xint32)', 12, True), ('绝对指针(3xint64)', 24, False)]
+    for ks_name, kc_name in pairs:
+        if ks_name not in secs:
+            continue
+        ks_addr, ks_off, ks_size = secs[ks_name]
+        if kc_name not in secs:
+            print('[WARN] 缺 %s，跳过 %s' % (kc_name, ks_name), file=sys.stderr)
+            continue
+        _a, kc_off, kc_size = secs[kc_name]
+        f.seek(ks_off)
+        ks_raw = f.read(ks_size)
+        f.seek(kc_off)
+        kc_raw = f.read(kc_size)
+
+        best = None
+        for lname, entsz, is_prel in layouts:
+            n = ks_size // entsz
+            if n <= 0:
+                continue
+            got, table = 0, {}
+            for i in range(n):
+                base = i * entsz
+                if is_prel:
+                    name_addr = ks_addr + base + 4 + struct.unpack_from('<i', ks_raw, base + 4)[0]
+                else:
+                    name_addr = struct.unpack_from('<Q', ks_raw, base + 8)[0]
+                o = in_ranges(name_addr, name_ranges) or in_ranges(name_addr, ranges)
+                if o is None:
+                    continue
+                sym = read_cstr(o)
+                if not sym or not pat.match(sym):
+                    continue
+                if (i + 1) * 4 > len(kc_raw):
+                    continue
+                table[sym] = struct.unpack_from('<I', kc_raw, i * 4)[0]
+                got += 1
+            print('[i] %s 按 %s 解析：%d 项里认出 %d 个符号' % (ks_name, lname, n, got))
+            if best is None or got > best[1]:
+                best = (table, got, lname)
+        if best and best[1]:
+            out.update(best[0])
+            print('[i]   -> 采用 %s 的 %d 个符号' % (best[2], best[1]))
+
+    if not out:
+        print('[FAIL] 没能从 vmlinux 解析出任何符号 CRC', file=sys.stderr)
+        return 2
+    with open(args.output, 'w', encoding='utf-8') as fo:
+        for s in sorted(out):
+            fo.write('0x%08x\t%s\tvmlinux\tEXPORT_SYMBOL\n' % (out[s], s))
+    print('[+] 写入 %s（%d 个符号）' % (args.output, len(out)))
+    return 0
+
+
 def cmd_check(args):
     base = {}
     with open(args.baseline, encoding='utf-8') as f:
@@ -193,6 +330,12 @@ def main():
     c.add_argument('symvers')
     c.add_argument('-b', '--baseline', required=True)
     c.set_defaults(func=cmd_check)
+
+    v = sub.add_parser('dump-vmlinux',
+                       help='从 vmlinux(ELF) 导出符号 CRC 表（只编 Image、没有 Module.symvers 时用）')
+    v.add_argument('vmlinux')
+    v.add_argument('-o', '--output', required=True)
+    v.set_defaults(func=cmd_dump_vmlinux)
 
     args = ap.parse_args()
     return args.func(args)
