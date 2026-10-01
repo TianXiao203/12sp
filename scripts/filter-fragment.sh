@@ -6,8 +6,10 @@
 # Docker 碎片就稳定 725/1241 符号 CRC 不一致。需要把碎片拆开、逐组验证。
 #
 # 用法: bash scripts/filter-fragment.sh <源碎片> <模式> <输出文件>
-#   模式 all    —— 原样复制（不过滤）
+#   模式 all     —— 原样复制（不过滤）
 #   ns          —— 只保留命名空间组（PID_NS/USER_NS/IPC_NS/POSIX_MQUEUE...）
+#   userns      —— 命名空间组里只留 USER_NS（bisect 细分）
+#   ipc         —— 命名空间组里只留 IPC_NS/POSIX_MQUEUE(+SYSCTL)（bisect 细分）
 #   cgroup      —— 只保留 cgroup 组（CGROUP_DEVICE/CGROUP_PIDS/...）
 #   none        —— 只保留"本来就是 y"的对齐项（IKCONFIG 等）
 #
@@ -34,6 +36,13 @@ case "$MODE" in
     ALLOW="CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_UTS_NS CONFIG_USER_NS
 CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_POSIX_MQUEUE_SYSCTL"
     ;;
+  userns)
+    ALLOW="CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_UTS_NS CONFIG_USER_NS"
+    ;;
+  ipc)
+    ALLOW="CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_UTS_NS
+CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_POSIX_MQUEUE_SYSCTL"
+    ;;
   cgroup)
     ALLOW="CONFIG_CGROUPS CONFIG_CGROUP_DEVICE CONFIG_CGROUP_FREEZER CONFIG_CGROUP_PIDS
 CONFIG_CGROUP_SCHED CONFIG_CPUSETS CONFIG_MEMCG CONFIG_CGROUP_CPUACCT CONFIG_BLK_CGROUP"
@@ -44,7 +53,7 @@ CONFIG_VETH CONFIG_BRIDGE CONFIG_OVERLAY_FS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER
 CONFIG_CGROUP_BPF CONFIG_BPF_SYSCALL"
     ;;
   *)
-    echo "[filter-fragment] 未知模式 '$MODE'（只能是 all|ns|cgroup|none）" >&2
+    echo "[filter-fragment] 未知模式 '$MODE'（只能是 all|ns|userns|ipc|cgroup|none）" >&2
     exit 2
     ;;
 esac
