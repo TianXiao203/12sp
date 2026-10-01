@@ -124,7 +124,17 @@ fi
 
 echo
 echo "[+] 关键项最终状态："
-grep -E '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SECCOMP_FILTER|KSU|KSU_TRACEPOINT_HOOK)=' "$DEFCONFIG" | sed 's/^/      /' || true
+grep -E '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|POSIX_MQUEUE|IPC_NS|SECCOMP_FILTER|KSU|KSU_TRACEPOINT_HOOK)=' "$DEFCONFIG" | sed 's/^/      /' || true
+
+echo
+echo "[i] ABI 铁律：下面几项必须【不在】defconfig 里（=n），否则 ROM 的 vendor 模块会拒载："
+for k in CONFIG_NF_TABLES CONFIG_NF_TABLES_BRIDGE CONFIG_SYSVIPC; do
+  if grep -qE "^${k}=" "$DEFCONFIG"; then
+    echo "      [FAIL] $k 出现了！"
+  else
+    echo "      [OK]   $k 未出现"
+  fi
+done
 
 echo
 echo "完成。下一步：bash scripts/integrate-resukisu.sh $KP_ROOT main kprobes"

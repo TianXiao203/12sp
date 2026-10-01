@@ -29,9 +29,12 @@ echo "[+] 使用配置文件: $CONFIG_FILE"
 echo
 
 # 期望 =y 的项
-# 注：CONFIG_SYSVIPC 与 CONFIG_IPC_NS 是本机备份出来的设备 /proc/config.gz
-#     实测发现缺失后补上的（设备上 SYSVIPC/POSIX_MQUEUE 都是 not set，
-#     导致 IPC_NS 依赖不满足、连符号行都没有）。
+# 注：CONFIG_POSIX_MQUEUE + CONFIG_IPC_NS 是本机设备 /proc/config.gz 实测发现
+#     缺失后补上的：设备上 SYSVIPC / POSIX_MQUEUE 都是 not set，导致
+#     IPC_NS 的依赖 (SYSVIPC || POSIX_MQUEUE) 不满足、连符号行都没有。
+#     ★ 这里选 POSIX_MQUEUE 而不是 SYSVIPC —— 后者会给 struct task_struct
+#       加 sysvsem/sysvshm 成员，改变结构体布局 → 所有相关导出符号的 CRC 变化
+#       → ROM 里预编译的 vendor 模块集体拒载 → 卡在开机 logo。见下面 FORBIDDEN_Y。
 REQUIRED_Y="
 CONFIG_CGROUPS
 CONFIG_CGROUP_DEVICE
@@ -45,7 +48,7 @@ CONFIG_BLK_CGROUP
 CONFIG_NAMESPACES
 CONFIG_NET_NS
 CONFIG_PID_NS
-CONFIG_SYSVIPC
+CONFIG_POSIX_MQUEUE
 CONFIG_IPC_NS
 CONFIG_UTS_NS
 CONFIG_USER_NS
@@ -59,11 +62,24 @@ CONFIG_BPF_SYSCALL
 CONFIG_KSU
 "
 
+# ★ 绝对不能为 y 的项（ABI 铁律）★
+#   它们会改变【被导出符号可见的结构体布局】，让内核算出的符号 CRC 与
+#   ROM 里预编译 vendor 模块记录的期望值不一致 → 模块全部拒载 →
+#   显示驱动没加载 → 屏幕永远停在米标，且无 panic、无日志、pstore 空。
+#     CONFIG_NF_TABLES      -> include/net/net_namespace.h:145
+#                              struct net 多出 netns_nftables nft;
+#     CONFIG_SYSVIPC        -> include/linux/sched.h:973
+#                              struct task_struct 多出 sysv_sem sysvsem / sysv_shm sysvshm;
+#     CONFIG_NF_TABLES_BRIDGE / CONFIG_BRIDGE_NETFILTER -> 同族，一并回避
+FORBIDDEN_Y="
+CONFIG_NF_TABLES
+CONFIG_NF_TABLES_BRIDGE
+CONFIG_SYSVIPC
+"
+
 # 期望开启但允许缺失（不同内核版本符号名可能不同）
 OPTIONAL_Y="
 CONFIG_BRIDGE_NETFILTER
-CONFIG_NF_TABLES
-CONFIG_NF_TABLES_BRIDGE
 CONFIG_KSU_TOOLKIT_SUPPORT
 CONFIG_KSU_MULTI_MANAGER_SUPPORT
 CONFIG_IKCONFIG
@@ -87,6 +103,18 @@ for k in $REQUIRED_Y; do
   else
     printf '%-38s %s\n' "$k" "FAIL 符号不存在"
     FAIL=$((FAIL+1))
+  fi
+done
+
+echo
+echo "ABI 铁律检查（这几项一旦为 y，ROM 里预编译的 vendor 模块会全部拒载 -> 卡米标）："
+for k in $FORBIDDEN_Y; do
+  if grep -q "^${k}=y$" "$CONFIG_FILE"; then
+    printf '%-38s %s\n' "$k" "FAIL 竟然是 y —— ABI 会被破坏，先别刷！"
+    FAIL=$((FAIL+1))
+  else
+    printf '%-38s %s\n' "$k" "OK 非 y（正确）"
+    PASS=$((PASS+1))
   fi
 done
 

@@ -21,7 +21,8 @@
 | 内核源码 | `LineageOS/android_kernel_xiaomi_sm8450`，分支 **`lineage-23.2`** |
 | 内核 commit | **`ef362912d37b761041709638c1e571d6394e9558`**（与设备 `-gef362912d37b` 完全对应） |
 | 要改的 defconfig | `arch/arm64/configs/gki_defconfig`（**本体**，不是 `vendor/*.config` 碎片） |
-| Docker 掉链子的原因 | **三处**：`CONFIG_CGROUP_DEVICE` 未开 + `CONFIG_PID_NS` 被关 + **`CONFIG_SYSVIPC` 未开导致 `CONFIG_IPC_NS` 连符号都没有** |
+| Docker 掉链子的原因 | **三处**：`CONFIG_CGROUP_DEVICE` 未开 + `CONFIG_PID_NS` 被关 + **`CONFIG_IPC_NS` 连符号都没有**（依赖 `SYSVIPC \|\| POSIX_MQUEUE` 不满足） |
+| ★ ABI 铁律（最重要） | **绝不能开 `CONFIG_NF_TABLES` / `CONFIG_SYSVIPC`** —— 它们会改变 `struct net` / `struct task_struct` 布局，使导出符号 CRC 变化 → ROM 里 395 个预编译 vendor 模块**全部拒载** → **屏幕永远停在米标**（无 panic、无日志）。详见第 2.2 节 |
 | 刷机方式 | **只刷 boot.img / AK3 就够**（AK3 只换 kernel Image，保留原机 DTB/ramdisk） |
 | 为什么只刷 boot 就够 | 同分支同 commit → `uname -r` 完全一致 → vermagic 与 `CONFIG_MODVERSIONS` 符号 CRC 一致 |
 | 当前活动槽位 | **`_b`**（boot_b = /dev/block/sde43；boot_a = /dev/block/sde14） |
@@ -52,13 +53,14 @@
 | **`CONFIG_PID_NS`** | **`# CONFIG_PID_NS is not set`** | **必须改这一行** ← 核心 |
 | `CONFIG_UTS_NS` | 设备实测 `=y` | 无需改 |
 | **`CONFIG_USER_NS`** | **`# CONFIG_USER_NS is not set`（Kconfig `default n`）** | **必须追加 `=y`** |
-| **`CONFIG_SYSVIPC`** | **`# CONFIG_SYSVIPC is not set`** | **必须追加 `=y`** ← 原清单漏项 |
-| **`CONFIG_IPC_NS`** | **设备上连这一行都没有**（依赖 `IPC_NS depends on (SYSVIPC \|\| POSIX_MQUEUE)` 不满足） | **先开 SYSVIPC，它才会出现并成为 `=y`** ← 原清单漏项 |
+| **`CONFIG_IPC_NS`** | **设备上连这一行都没有**（依赖 `IPC_NS depends on (SYSVIPC \|\| POSIX_MQUEUE)` 不满足） | **开 `POSIX_MQUEUE` 让它出现**（**不要**用 SYSVIPC，见 2.2 节） |
 | `CONFIG_VETH` | `=y` | 无需改 |
 | `CONFIG_BRIDGE` | `=y` | 无需改 |
-| **`CONFIG_BRIDGE_NETFILTER`** | `# ... is not set` | 建议追加 `=y` |
-| **`CONFIG_NF_TABLES`** | `# ... is not set`（nftables 整族都没开） | chroot 里若用 iptables-nft 则追加 |
-| **`CONFIG_NF_TABLES_BRIDGE`** | 符号行不存在（依赖 `NF_TABLES` + `BRIDGE`） | 开了 `NF_TABLES` 后追加 |
+| **`CONFIG_POSIX_MQUEUE`** | `# CONFIG_POSIX_MQUEUE is not set` | **追加 `=y`**（只为满足 `IPC_NS` 的依赖；`struct ipc_namespace` 是无条件定义，布局安全） |
+| ~~`CONFIG_SYSVIPC`~~ | `# ... is not set` | **⛔ 绝对不要开** —— 会给 `struct task_struct` 加 `sysvsem`/`sysvshm`，ABI 崩 |
+| ~~`CONFIG_NF_TABLES`~~ | `# ... is not set` | **⛔ 绝对不要开** —— 会给 `struct net` 加成员，ABI 崩 |
+| ~~`CONFIG_NF_TABLES_BRIDGE`~~ / ~~`CONFIG_BRIDGE_NETFILTER`~~ | 前者的符号行不存在；后者 `not set` | **⛔ 一并回避**（同族，且 Docker 走 iptables-legacy 就够） |
+| `CONFIG_NETFILTER_XTABLES` / `IP_NF_IPTABLES` / `IP_NF_FILTER` / `IP_NF_NAT` / `IP_NF_TARGET_MASQUERADE` | **全部 `=y`（内建）** | 无需改 → Docker 用 **iptables-legacy** 即可做 bridge/NAT |
 | `CONFIG_OVERLAY_FS` | `=y` | 无需改 |
 | `CONFIG_SECCOMP` / `SECCOMP_FILTER` | **设备实测 `=y`** | 本来就开；显式写一遍便于校验 |
 | `CONFIG_CGROUP_BPF` | `=y` | 无需改 |
@@ -66,17 +68,57 @@
 | `CONFIG_KPROBES` | `=y` | 无需改（ReSukiSU 默认 hook 需要） |
 | `CONFIG_KSU` | ABSENT | 追加 `=y` |
 
-**关于"某项在源码里不存在时怎么办"**：你清单里的项在 5.10 都有对应 Kconfig 符号，
-没有需要找替代方案的。但有两项要特别注意：
+**关于"某项在源码里不存在时怎么办"**：你清单里的项在 5.10 都有对应 Kconfig 符号。
+但 `CONFIG_IPC_NS` 是个特例 —— 它在**设备上连符号行都没有**（不是 `=n`，是根本没这一行），
+因为它的依赖 `IPC_NS depends on (SYSVIPC || POSIX_MQUEUE)` 两个都是 `not set`。
+这类"依赖不满足因而不可见"的项，必须先开前置项它才会出现；照原清单只写
+`CONFIG_IPC_NS=y`，`olddefconfig` 会把它又关掉 —— 编译不报错，但功能没生效。
 
-- `CONFIG_IPC_NS` 在**设备上连符号行都没有**（不是 `=n`，是根本没这一行），
-  因为它的依赖 `SYSVIPC || POSIX_MQUEUE` 两个都是 `not set`。
-  这类"依赖不满足因而不可见"的项，必须先开前置项，它才会出现。
-- `CONFIG_NF_TABLES_BRIDGE` 同理，依赖 `NF_TABLES` + `BRIDGE`；
-  `NF_TABLES=n` 时它在 .config 里也不存在。
+前置项**用 `CONFIG_POSIX_MQUEUE=y`，不要用 `CONFIG_SYSVIPC`**，原因见 2.2 节。
 
-这两条是你原清单里没有的信息，如果只照着清单加 `CONFIG_IPC_NS=y`，
-`olddefconfig` 会因为你没开 `SYSVIPC` 而把它又关掉 —— 编译不报错，但功能没生效。
+### 2.2 ★ ABI 铁律：开了 `NF_TABLES` / `SYSVIPC` 就会"永远停在米标" ★
+
+**这是本项目踩过的最贵的坑，务必先读。**
+
+Android GKI 的内核与 vendor 模块是**分离编译**的：ROM 里
+`/vendor/lib/modules/*.ko`（本机 395 个）在编译时把"它需要的每个内核符号的 CRC"
+写进了自己的 `__versions` 段。内核加载模块时会拿自己算出的 CRC 比对，
+**不一致就直接拒绝加载**。
+
+而 CRC 由 `genksyms` 从**类型定义**算出来 —— 所以：
+
+> 只要某个被导出符号签名涉及的结构体，其布局与官方内核不同，该符号 CRC 就变，
+> 对应模块全部拒载。
+
+**后果为什么是"卡米标"**：米标是 bootloader 画的；内核接手屏幕要靠 vendor 模块里的
+显示驱动（`msm_drm.ko`）。模块集体拒载 → 显示驱动没加载 → **屏幕永远停在米标**，
+**没有 panic、没有日志、pstore 也是空的**（是 hang，不是 crash）—— 极难排查。
+
+本次实测踩到的两个开关：
+
+| 配置 | 源码位置 | 后果 |
+|---|---|---|
+| `CONFIG_NF_TABLES=y` | `include/net/net_namespace.h:145`<br>`#if defined(CONFIG_NF_TABLES) ... struct netns_nftables nft;` | `struct net` 多一个成员 → 所有含 `struct net *` 的导出符号 CRC 全变 |
+| `CONFIG_SYSVIPC=y` | `include/linux/sched.h:973`<br>`#ifdef CONFIG_SYSVIPC ... struct sysv_sem sysvsem; struct sysv_shm sysvshm;` | `struct task_struct` 多两个成员 → 影响面更大 |
+
+**已验证"布局安全"的（本项目实际启用的）**：
+
+| 配置 | 为什么安全 |
+|---|---|
+| `CGROUP_DEVICE` / `CGROUP_PIDS` | 只新增内部 cgroup 子系统，不改任何导出可见结构 |
+| `PID_NS` | `struct pid_namespace` 无条件定义、无相关条件成员 |
+| `USER_NS` | `struct cred.user_ns` 等本来就是无条件字段 |
+| `IPC_NS` + `POSIX_MQUEUE` | `struct ipc_namespace` 无条件定义，其成员无 `#ifdef CONFIG_POSIX_MQUEUE` |
+| `KSU` | ReSukiSU 本身就以"兼容 GKI 预编译模块"为设计目标 |
+
+**怎么保证不再踩**（三层防护，都已落地）：
+
+1. `configs/docker-cgroup.fragment` 里**不包含**任何 ABI 危险项，并在开头写明原因；
+2. 工作流有一步「兜底：确保 ABI 危险项一定不在 defconfig 里」，手滑加回来自动删掉；
+   `verify-built-config.sh` 也把这三项列为 `FORBIDDEN_Y`（必须非 y）；
+3. **`ABI 预检`**：编译完立刻用 `scripts/check-abi-crc.py` 把自编内核的
+   `Module.symvers` 与真机模块的 CRC 基线（`abi-baseline/abi-crcs.txt`，1613 个符号）
+   逐一比对，**不一致 CI 直接报红，别刷**。
 
 ### 为什么 `CONFIG_CGROUP_DEVICE` 是"不存在"而不是"没开"
 
@@ -659,6 +701,19 @@ mount -t cgroup -o devices devices /sys/fs/cgroup/devices
 
 4. 检查 `/proc/cmdline` 有没有 `cgroup_disable=xxx`（有的话会禁掉对应控制器）。
 5. `overlay2` 存储驱动：`CONFIG_OVERLAY_FS=y` 已满足。
+6. **iptables 必须用 legacy 后端**（内核里没有 `NF_TABLES` —— 那是 ABI 安全不得不
+   做的取舍，见 2.2 节；而 `NETFILTER_XTABLES` / `IP_NF_IPTABLES` / `IP_NF_NAT` /
+   `IP_NF_TARGET_MASQUERADE` 全是 `=y` 内建，够 Docker 用）。Ubuntu 22.04+ 的
+   `iptables` 默认走 nft 后端，需要在 chroot 里切一下：
+
+   ```sh
+   update-alternatives --set iptables  /usr/sbin/iptables-legacy
+   update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+   iptables -V          # 应显示 (legacy)
+   ```
+
+   如果要用 bridge 网络且需要过滤同网桥内的转发流量，那还需要 br_netfilter；
+   本内核**没有**开（同样为了 ABI 安全），容器访问外网走路由路径，不受影响。
 
 ---
 
@@ -721,6 +776,8 @@ scripts/verify-built-config.sh             编译后核对 .config 并比对 ker
 scripts/pack-anykernel3.sh                 生成只换 kernel 的 AnyKernel3 包（含 anykernel.sh 自检）
 scripts/patch-ak3-zip.py                   就地替换已有 AK3 zip 里的 anykernel.sh（免重编）
 scripts/make-bootimg-via-adb.sh            在手机上用 magiskboot 把 Image 打成可刷的 boot.img
+scripts/check-abi-crc.py                   ABI 预检：解析 .ko 的 __versions / Module.symvers，比对符号 CRC
+abi-baseline/abi-crcs.txt                  真机 vendor 模块的符号 CRC 基线（1613 个符号，ABI 预检用）
 scripts/device-verify.sh                   手机上一键验证（只读）
 anykernel3/anykernel.sh                    AnyKernel3 配置（device.name1=unicorn）
 .github/workflows/build-unicorn-kernel.yml GitHub Actions 构建工作流
@@ -738,11 +795,13 @@ anykernel3/anykernel.sh                    AnyKernel3 配置（device.name1=unic
 | 编出来 KSU 不生效 | 只跑了 setup.sh，没写 `CONFIG_KSU=y` | 查 `out/**/.config` 里 `CONFIG_KSU=y` |
 | `drivers/kernelsu` 消失 | 之后跑过 `make mrproper` / `git clean -fdx` | 重跑 `integrate-resukisu.sh` |
 | 能开机但 Wi-Fi/蓝牙/音频没了 | 内核分支/commit 与设备不一致 → vermagic 不匹配 | 把 `kernel_commit` 钉到设备 `uname -r` 里 `-g` 后面的那个 commit |
-| 加了 `CONFIG_IPC_NS=y` 但 `/proc/self/ns/ipc` 还是不存在 | 没先开 `CONFIG_SYSVIPC=y`，依赖不满足被 `olddefconfig` 关掉 | 两个一起写；`verify-built-config.sh` 现在把两者都列为必需项 |
+| 加了 `CONFIG_IPC_NS=y` 但 `/proc/self/ns/ipc` 还是不存在 | 前置依赖没满足，被 `olddefconfig` 关掉（`IPC_NS depends on (SYSVIPC \|\| POSIX_MQUEUE)`） | 开 `CONFIG_POSIX_MQUEUE=y`（**别用 SYSVIPC**，会 ABI 崩）；`verify-built-config.sh` 已把两者列为必需项 |
+| **刷进去永远停在米标，无任何报错、pstore 空** | **ABI 不兼容**：开了会改结构体布局的配置（`NF_TABLES` → `struct net`；`SYSVIPC` → `struct task_struct`），符号 CRC 变了，ROM 里 395 个 vendor 模块**全部拒载**，显示驱动也没加载 | 看 CI 的 **ABI 预检**结果；把危险项移出 fragment（`configs/docker-cgroup.fragment` 开头有清单）。`scripts/check-abi-crc.py check <Module.symvers> -b abi-baseline/abi-crcs.txt` 可本地复现 |
+| 开机卡在 logo（另一种原因） | DTB 不匹配 | 用 AK3 只换 Image（不要换 dtb）；不要手工拼 v3 header 包 |
+| `/proc/config.gz` 不存在 | 未开 `CONFIG_IKCONFIG_PROC` | 你设备本来就开了（实测 `=y`），无需处理 |
 | `cat /proc/cgroups` 里没 devices | 改错了文件，或碎片被覆盖 | 确认改的是 `arch/arm64/configs/gki_defconfig` |
 | adb shell 里 `su` 找不到 | ReSukiSU 的 su 未对 adb shell 暴露 | 用 KSU 管理器自带的终端跑验证命令 |
 | 开机卡在 logo | DTB 不匹配 | 用 AK3 只换 Image（不要换 dtb）；不要手工拼 v3 header 包 |
-| `/proc/config.gz` 不存在 | 未开 `CONFIG_IKCONFIG_PROC` | 你设备本来就开了（实测 `=y`），无需处理 |
 | 刷完 `uname -r` 没变 | 刷到了非活动槽位 | 你设备活动槽是 `_b`；用 AK3 会自动处理，手工刷时确认目标分区 |
 | 编出来是 `5.10.260-gki-gef362912d37b-dirty` | 工作树有未提交改动，`setlocalversion` 追加了 `-dirty` | 已在 `assemble` 里写 `.scmversion` 冻结（见 5.0）；若仍出现，检查 `$WS/common/.scmversion` 是否存在 |
 | CI 上 `cp: cannot stat '.../anykernel3/anykernel.sh'`，步骤 1 秒失败且无报错 | 该文件被 `.gitignore` 的大小写冲突漏掉，从未入库 | `git check-ignore -v <文件>` 验证；**Windows 上绝不能写大小写只差的名字**（如 `AnyKernel3/` 会连 `anykernel3/` 一起忽略）。工作流第 2 步「预检」现在会提前拦下 |

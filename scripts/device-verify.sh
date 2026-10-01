@@ -84,8 +84,8 @@ echo
 
 echo "==================== 5. /proc/config.gz（若内核开了 IKCONFIG_PROC） ===================="
 if [ -f /proc/config.gz ]; then
-  for k in CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS NET_NS NF_TABLES NF_TABLES_BRIDGE \
-           BRIDGE_NETFILTER VETH BRIDGE OVERLAY_FS SECCOMP_FILTER CGROUP_BPF BPF_SYSCALL KSU; do
+  for k in CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS NET_NS \
+           VETH BRIDGE OVERLAY_FS SECCOMP_FILTER CGROUP_BPF BPF_SYSCALL KSU; do
     V="$(zcat /proc/config.gz 2>/dev/null | grep "^CONFIG_${k}=" | head -n1)"
     if [ -z "$V" ]; then
       V="$(zcat /proc/config.gz 2>/dev/null | grep "^# CONFIG_${k} is not set" | head -n1)"

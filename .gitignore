@@ -37,3 +37,6 @@ __pycache__/
 boot-unicorn-custom.img
 boot_b_backup.img
 *.img
+
+# ABI 基线：模块二进制很大且属 ROM 版权物，只入库抽出来的 CRC 表
+abi-baseline/*.ko

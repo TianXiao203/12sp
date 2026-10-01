@@ -246,16 +246,27 @@ cleanup_in_tree
 step "6. 关键项自检（$OUT_ABS/.config）"
 FAIL=0
 for k in CGROUP_DEVICE CGROUP_PIDS CGROUP_FREEZER CGROUP_SCHED CPUSETS MEMCG BLK_CGROUP \
-         PID_NS USER_NS SYSVIPC IPC_NS NET_NS UTS_NS \
+         PID_NS USER_NS POSIX_MQUEUE IPC_NS NET_NS UTS_NS \
          VETH BRIDGE OVERLAY_FS SECCOMP SECCOMP_FILTER CGROUP_BPF BPF_SYSCALL \
-         KSU LTO_CLANG_THIN LTO_CLANG_FULL LOCALVERSION IKCONFIG IKCONFIG_PROC; do
+         KSU LTO_CLANG_THIN LTO_CLANG_FULL LOCALVERSION IKCONFIG IKCONFIG_PROC \
+         NF_TABLES NF_TABLES_BRIDGE BRIDGE_NETFILTER SYSVIPC; do
   # tail -1：defconfig 风格的输入里同一符号可能既有 "# ... is not set" 又有 "=y"，
   #          按 kconfig 的规则【后出现的胜出】，所以取最后一行才反映真实取值。
   line=$(grep -E "^CONFIG_${k}=|^# CONFIG_${k} is not set" "$OUT_ABS/.config" | tail -1)
   printf '  %-24s %s\n' "CONFIG_$k" "${line:-<符号行不存在>}"
 done
-for k in CGROUP_DEVICE PID_NS USER_NS SYSVIPC KSU; do
+for k in CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS KSU; do
   grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config" || { say "  [FAIL] CONFIG_$k 不是 y"; FAIL=$((FAIL+1)); }
+done
+# ★ ABI 铁律：这几项必须【不是 y】——
+#   NF_TABLES 会给 struct net 加成员、SYSVIPC 会给 struct task_struct 加成员，
+#   一旦开启，所有相关导出符号的 CRC 都会变，ROM 里预编译的 vendor 模块
+#   全部拒载 → 屏幕永远停在米标（无 panic、无日志）。详见 fragment 开头。
+for k in NF_TABLES NF_TABLES_BRIDGE SYSVIPC; do
+  if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
+    say "  [FAIL] CONFIG_$k=y —— 这是 ABI 危险项，会让 ROM 的 vendor 模块拒载（卡米标）"
+    FAIL=$((FAIL+1))
+  fi
 done
 if ! grep -q "^CONFIG_LTO_CLANG_THIN=y$" "$OUT_ABS/.config"; then
   say "  [WARN] LTO 不是 thin（若 clang 缺失会这样），Full LTO 在 16GB runner 上有 OOM 风险"

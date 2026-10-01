@@ -73,7 +73,7 @@ else
 fi
 echo
 echo "  期望看到的关键项："
-grep -E '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|NF_TABLES|BRIDGE_NETFILTER|KSU)=' \
+grep -E '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|POSIX_MQUEUE|IPC_NS|KSU)=' \
   "$ROOT/$KERNEL_SRC/arch/arm64/configs/gki_defconfig" | sed 's/^/    /' || true
 echo
 

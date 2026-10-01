@@ -65,14 +65,6 @@ on:
           - kprobes
           - tracepoint
           - manual
-      enable_nftables:
-        description: '开启 nftables 族（chroot 里 Docker 用 iptables-nft 时需要）'
-        required: true
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
       enable_susfs:
         description: '开启 SUSFS（还需自行打内核侧补丁，默认关）'
         required: true
@@ -135,7 +127,7 @@ jobs:
       IN_VARIANT: ${{ inputs.variant }}
       IN_KSU_BRANCH: ${{ inputs.resukisu_branch }}
       IN_KSU_HOOK: ${{ inputs.resukisu_hook }}
-      IN_NFTABLES: ${{ inputs.enable_nftables }}
+      IN_ENABLE_SUSFS: ${{ inputs.enable_susfs }}
       IN_SUSFS: ${{ inputs.enable_susfs }}
       IN_FREE_DISK: ${{ inputs.free_disk }}
       IN_SWAP: ${{ inputs.enable_swap }}
@@ -307,13 +299,24 @@ jobs:
                "$WS/common" \
                "$GITHUB_WORKSPACE/configs/docker-cgroup.fragment"
 
-      - name: 按需关闭 nftables
-        if: ${{ inputs.enable_nftables == 'false' }}
+      - name: 兜底：确保 ABI 危险项一定不在 defconfig 里
         run: |
+          # 这三项会改变【被导出符号可见的结构体布局】，导致 ROM 里预编译的
+          # vendor 模块集体拒载 → 卡在米标（详见 configs/docker-cgroup.fragment 开头）。
+          #   NF_TABLES        -> struct net 多一个成员（net_namespace.h:145）
+          #   SYSVIPC          -> struct task_struct 多两个成员（sched.h:973）
+          #   BRIDGE_NETFILTER -> 与 net 路径相关，一并回避
+          # 这里做一次硬兜底，防止以后有人手滑把它加回 fragment。
           set -e
           DEF="$WS/common/arch/arm64/configs/gki_defconfig"
-          sed -i '/^CONFIG_NF_TABLES=/d; /^CONFIG_NF_TABLES_BRIDGE=/d; /^CONFIG_BRIDGE_NETFILTER=/d' "$DEF"
-          echo "[+] 已移除 NF_TABLES / NF_TABLES_BRIDGE / BRIDGE_NETFILTER"
+          for k in CONFIG_NF_TABLES CONFIG_NF_TABLES_BRIDGE CONFIG_BRIDGE_NETFILTER CONFIG_SYSVIPC; do
+            if grep -qE "^${k}=" "$DEF"; then
+              echo "[WARN] $DEF 里出现了 $k，正在移除（它会让 ABI 与 ROM 模块不兼容）"
+              sed -i "/^${k}=/d; /^# ${k} is not set/d" "$DEF"
+            fi
+          done
+          echo "[+] 检查完毕，当前 gki_defconfig 里这几项的状态："
+          grep -nE '^(# )?CONFIG_(NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SYSVIPC|POSIX_MQUEUE|IPC_NS)=' "$DEF" || echo "    （都已不在文件中，即均为 n）"
 
       - name: 集成 ReSukiSU
         run: |
@@ -343,7 +346,7 @@ jobs:
           echo "== 本树 vendor/ 下的碎片文件 =="
           ls -1 "$WS/common/arch/arm64/configs/vendor/" 2>/dev/null || true
           echo "== 关键配置最终状态（都应出现在 gki_defconfig 本体里）=="
-          grep -nE '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SECCOMP_FILTER|KSU|KSU_[A-Z_]+|KPROBES|LOCALVERSION)=' "$DEF" || true
+          grep -nE '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|POSIX_MQUEUE|IPC_NS|SECCOMP_FILTER|KSU|KSU_[A-Z_]+|KPROBES|LOCALVERSION|NF_TABLES|SYSVIPC|BRIDGE_NETFILTER)=' "$DEF" || true
           echo "== drivers/ 里的 KSU 集成痕迹 =="
           ls -l "$WS/common/drivers/kernelsu" || true
           grep -n kernelsu "$WS/common/drivers/Makefile" || true
@@ -400,7 +403,7 @@ jobs:
           echo "[+] 复用 $KCONFIG_CONFIG（$(grep -c '^CONFIG_' "$KCONFIG_CONFIG") 行 CONFIG_）"
 
           # 把关键编译期配置先打出来，便于事后核对
-          grep -E '^CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|KSU|CGROUP_DEVICE|PID_NS|SYSVIPC)=' \
+          grep -E '^CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|KSU|CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|POSIX_MQUEUE|IPC_NS)=' \
             "$KCONFIG_CONFIG" | sed 's/^/    /' || true
 
           echo "== 开始编译 Image（预计 20~60 分钟）=="
@@ -522,6 +525,16 @@ jobs:
 
           CFG="$(find "$WS/out" -maxdepth 8 -type f -name '.config' -print -quit 2>/dev/null || true)"
           if [ -n "$CFG" ]; then cp -f "$CFG" "$GITHUB_WORKSPACE/upload/kernel.config.txt"; fi
+
+          # ABI 预检要用：内核为每个导出符号算出的 CRC，全在这个文件里。
+          # 有了它才能和 ROM 里 vendor 模块的期望值比对（见下面的 "ABI 预检" 步骤）。
+          SYMV="$(find "$WS/out" -maxdepth 4 -type f -name 'Module.symvers' -print -quit || true)"
+          if [ -n "$SYMV" ]; then
+            cp -f "$SYMV" "$GITHUB_WORKSPACE/upload/kernel.Module.symvers"
+            echo "[+] Module.symvers 已收集: $SYMV ($(wc -l < "$SYMV") 个导出符号)"
+          else
+            echo "::warning title=缺 Module.symvers::没找到 Module.symvers，ABI 预检会跳过"
+          fi
           cp -f "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/upload/" 2>/dev/null || true
 
           echo "== 调用 pack-anykernel3.sh =="
@@ -572,6 +585,7 @@ jobs:
           mkdir -p art
           cp -f "$ZIP" art/anykernel3-unicorn.zip
           cp -f upload/kernel.config.txt art/ 2>/dev/null || true
+          cp -f upload/kernel.Module.symvers art/ 2>/dev/null || true
           cp -f build.log art/build.log 2>/dev/null || true
           {
             echo "run_id=${{ github.run_id }}"
@@ -596,6 +610,39 @@ jobs:
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
               ci-artifacts 2>&1 | tail -5
           echo "::notice title=产物已发布:: 分支 ci-artifacts/art/anykernel3-unicorn.zip（可匿名 clone）"
+
+      - name: ABI 预检（与 ROM 的 vendor 模块比对符号 CRC）—— 不一致就别刷
+        run: |
+          # 为什么必须有这一步：
+          #   自编内核和 ROM 里预编译的 /vendor/lib/modules/*.ko 是分离编译的。
+          #   模块把"它需要的每个内核符号的 CRC"写在自己的 __versions 段里，
+          #   内核加载模块时比对 CRC；不一致就拒载。而拒载最典型的后果是
+          #   【显示驱动模块没加载 → 屏幕永远停在米标】，没有 panic、没有日志。
+          #   所以在这里先用 ROM 模块的 CRC 基线核对一遍：CI 直接报红，别刷。
+          #
+          # 基线 abi-baseline/abi-crcs.txt 是从真机 /vendor/lib/modules 的
+          # .ko 里抽出来的（scripts/check-abi-crc.py baseline）。
+          set -uo pipefail
+          BASE="$GITHUB_WORKSPACE/abi-baseline/abi-crcs.txt"
+          SYMV="$GITHUB_WORKSPACE/upload/kernel.Module.symvers"
+          if [ ! -f "$BASE" ]; then
+            echo "::warning title=无 ABI 基线::找不到 $BASE，跳过 ABI 预检"
+            exit 0
+          fi
+          if [ ! -f "$SYMV" ]; then
+            echo "::error title=ABI 预检无法执行::没找到 $SYMV"
+            exit 1
+          fi
+          set +e
+          python3 "$GITHUB_WORKSPACE/scripts/check-abi-crc.py" check "$SYMV" -b "$BASE" \
+            2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=ABI 不兼容，先别刷！::内核导出的符号 CRC 与 ROM vendor 模块不一致，刷进去会卡在开机 logo（模块全部拒载）。详情见 job 输出里的 [FAIL] 列表。"
+            exit 1
+          fi
+          echo "::notice title=ABI 兼容::符号 CRC 与 ROM vendor 模块完全一致，可以刷"
 
       - name: 汇总诊断信息（无论成功失败都跑）
         if: always()
