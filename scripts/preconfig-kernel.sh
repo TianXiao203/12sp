@@ -160,12 +160,19 @@ CONFIG_LTO_CLANG_THIN=y
 # CONFIG_LTO_NONE is not set'
   say "[i] LTO 模式 = THIN（与官方不同，仅用于内存不足时兜底）"
 else
+  # FULL 模式下额外关掉调试信息（Run#8/#9 的 OOM 对策，之二）：
+  #   FULL LTO 的 ld -r 要在内存里给【全内核】生成 DWARF4，
+  #   16GB runner 上 --threads=1 之后仍被 OOM 整机杀掉（Run#9 实证）。
+  #   DEBUG_INFO 只是调试数据，模块加载只看 CRC/vermagic/CFI（类型哈希），
+  #   关掉不影响 vendor 模块兼容 —— 设备原版也是靠这些机制加载的。
+  #   thin 模式保留（thin 分模块代码生成，开着也编得过）。
   LTO_BODY='CONFIG_LTO=y
 CONFIG_LTO_CLANG=y
 CONFIG_LTO_CLANG_FULL=y
 # CONFIG_LTO_CLANG_THIN is not set
-# CONFIG_LTO_NONE is not set'
-  say "[i] LTO 模式 = FULL（与设备上能启动的内核一致）"
+# CONFIG_LTO_NONE is not set
+# CONFIG_DEBUG_INFO is not set'
+  say "[i] LTO 模式 = FULL（与设备上能启动的内核一致；DEBUG_INFO 已关 —— 16GB runner 内存对策，不影响模块兼容）"
 fi
 {
   echo "# 由 scripts/preconfig-kernel.sh 生成（LTO_MODE=$LTO_MODE）。"
