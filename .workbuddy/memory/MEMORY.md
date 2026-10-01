@@ -56,7 +56,12 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
    `gki_defconfig` / `drivers/Makefile` / `drivers/Kconfig`。
    对策：在**刚 checkout、树还干净时**写 `$WS/common/.scmversion` =
    `-g$(git rev-parse HEAD | cut -c1-12)`；setlocalversion 会优先读它并直接 return。
-2. **Windows 上写 `.gitignore` 必须逐个 `git check-ignore -v` 验证**：
+2. **clang 版本必须与设备内核一致**（`clang-r563880c`，clang 21.0.0 / build 14054515）。
+   因为 `CONFIG_CFI_CLANG=y` 的**类型哈希由编译器算出来**，而 ROM 里的
+   vendor_dlkm 模块是官方 clang 21 编的。内核换了 clang 版本 → 哈希对不上 →
+   刷进去**卡在开机 logo**，屏幕无报错、pstore 也为空（是 hang 不是 panic）。
+   实测：clang 12 编的刷进去卡 logo；用 clang 21 编的（用户当前内核）能启动。
+3. **Windows 上写 `.gitignore` 必须逐个 `git check-ignore -v` 验证**：
    本机 `core.ignorecase=true`，gitignore 匹配不区分大小写。
    曾因写 `AnyKernel3/` 把仓库里的 `anykernel3/` 一起忽略，导致该文件从未入库、
    CI 上 `cp` 找不到源文件而静默秒退。**绝不能出现大小写只差的名字。**
