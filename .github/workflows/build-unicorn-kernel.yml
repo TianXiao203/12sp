@@ -184,6 +184,7 @@ jobs:
             scripts/preconfig-kernel.sh
             scripts/assemble-lineage-kernel.sh
             scripts/pack-anykernel3.sh
+            scripts/filter-fragment.sh
             scripts/verify-built-config.sh
             configs/docker-cgroup.fragment
             anykernel3/anykernel.sh
@@ -328,17 +329,49 @@ jobs:
           set -e
           F="$GITHUB_WORKSPACE/ci/build-flags.txt"
           KSU_ENABLED=1
+          FRAGMENT_MODE=all
+          DEBUG_INFO_OFF=1
           if [ -f "$F" ]; then
             while IFS='=' read -r k v; do
               case "$k" in ''|\#*) continue;; esac
               k=$(echo "$k" | tr -d ' \r'); v=$(echo "$v" | tr -d ' \r')
-              [ "$k" = "KSU" ] && KSU_ENABLED=$([ "$v" = "off" ] && echo 0 || echo 1)
+              case "$k" in
+                KSU)         KSU_ENABLED=$([ "$v" = "off" ] && echo 0 || echo 1) ;;
+                FRAGMENT)    FRAGMENT_MODE="$v" ;;
+                DEBUG_INFO)  DEBUG_INFO_OFF=$([ "$v" = "off" ] && echo 1 || echo 0) ;;
+              esac
             done < "$F"
-            echo "[i] 构建开关生效: KSU=$([ "$KSU_ENABLED" = "1" ] && echo on || echo off)"
-          else
-            echo "[i] 没有 ci/build-flags.txt，全部用默认值（KSU=on）"
           fi
-          echo "KSU_ENABLED=$KSU_ENABLED" >> "$GITHUB_ENV"
+          echo "[i] 构建开关: KSU=$([ "$KSU_ENABLED" = "1" ] && echo on || echo off) FRAGMENT=$FRAGMENT_MODE DEBUG_INFO=$([ "$DEBUG_INFO_OFF" = "1" ] && echo off || echo on)"
+
+          # 按分组生成过滤后的碎片（bisect 用）；all 模式直接用原文件
+          FRAG_SRC="$GITHUB_WORKSPACE/configs/docker-cgroup.fragment"
+          if [ "$FRAGMENT_MODE" = "all" ]; then
+            FRAG_FILE="$FRAG_SRC"
+          else
+            mkdir -p "$GITHUB_WORKSPACE/.ci-fragment"
+            FRAG_FILE="$GITHUB_WORKSPACE/.ci-fragment/docker-$FRAGMENT_MODE.fragment"
+            bash "$GITHUB_WORKSPACE/scripts/filter-fragment.sh" "$FRAG_SRC" "$FRAGMENT_MODE" "$FRAG_FILE"
+          fi
+          # KSU 关闭时把 KSU 配置项从碎片里剔掉（否则 .config 里会留下 CONFIG_KSU=y）
+          if [ "$KSU_ENABLED" = "0" ] && [ "$FRAGMENT_MODE" = "all" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/.ci-fragment"
+            NK="$GITHUB_WORKSPACE/.ci-fragment/docker-noksu.fragment"
+            grep -vE '^(# )?CONFIG_KSU' "$FRAG_FILE" > "$NK"
+            FRAG_FILE="$NK"
+            echo "[i] KSU=off：已从碎片里剔除 CONFIG_KSU* 行"
+          fi
+          echo "FRAGMENT_FILE=$FRAG_FILE"    >> "$GITHUB_ENV"
+          echo "KSU_ENABLED=$KSU_ENABLED"    >> "$GITHUB_ENV"
+          echo "FRAGMENT_MODE=$FRAGMENT_MODE" >> "$GITHUB_ENV"
+          echo "DEBUG_INFO_OFF=$DEBUG_INFO_OFF" >> "$GITHUB_ENV"
+          # 分组模式（非 all）时 preconfig/verify 的"必须为 y"清单不再适用，
+          # 降级为警告，否则会在 preconfig 阶段就失败、拿不到 ABI 结论。
+          if [ "$FRAGMENT_MODE" = "all" ]; then
+            echo "RELAX_CONFIG_CHECK=0" >> "$GITHUB_ENV"
+          else
+            echo "RELAX_CONFIG_CHECK=1" >> "$GITHUB_ENV"
+          fi
 
       - name: 写入 Docker/cgroup + ReSukiSU 配置
         if: ${{ env.IN_MODE != 'control' }}
@@ -346,7 +379,7 @@ jobs:
           set -e
           bash "$GITHUB_WORKSPACE/scripts/apply-configs.sh" \
                "$WS/common" \
-               "$GITHUB_WORKSPACE/configs/docker-cgroup.fragment"
+               "${FRAGMENT_FILE:-$GITHUB_WORKSPACE/configs/docker-cgroup.fragment}"
 
       - name: 兜底：确保 ABI 危险项一定不在 defconfig 里
         if: ${{ env.IN_MODE != 'control' }}

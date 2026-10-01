@@ -170,9 +170,17 @@ else
 CONFIG_LTO_CLANG=y
 CONFIG_LTO_CLANG_FULL=y
 # CONFIG_LTO_CLANG_THIN is not set
-# CONFIG_LTO_NONE is not set
-# CONFIG_DEBUG_INFO is not set'
-  say "[i] LTO 模式 = FULL（与设备上能启动的内核一致；DEBUG_INFO 已关 —— 16GB runner 内存对策，不影响模块兼容）"
+# CONFIG_LTO_NONE is not set'
+  # DEBUG_INFO 默认关掉（16GB runner 的 OOM 对策）。
+  # DEBUG_INFO_OFF=0（ci/build-flags.txt 里 DEBUG_INFO=on）时保留调试信息——
+  # 用于裁决 725 个符号 CRC 差异是否与 DEBUG_INFO 有关（ABI bisect）。
+  if [ "${DEBUG_INFO_OFF:-1}" = "0" ]; then
+    say "[i] LTO 模式 = FULL；DEBUG_INFO 保持开启（bisect 试验，与设备一致）"
+  else
+    LTO_BODY="$LTO_BODY
+# CONFIG_DEBUG_INFO is not set"
+    say "[i] LTO 模式 = FULL（与设备上能启动的内核一致；DEBUG_INFO 已关 —— 16GB runner 内存对策）"
+  fi
 fi
 {
   echo "# 由 scripts/preconfig-kernel.sh 生成（LTO_MODE=$LTO_MODE）。"
@@ -287,10 +295,20 @@ done
 # KSU 可选：ci/build-flags.txt 里 KSU=off 时（KSU_ENABLED=0）不集成 ReSukiSU，
 # CONFIG_KSU 不会是 y —— 此时不能把它列进"必须为 y"的清单。
 KSU_ENABLED="${KSU_ENABLED:-1}"
+# RELAX_CONFIG_CHECK=1：bisect 用的分组碎片（FRAGMENT=ns/cgroup/none）只开一部分，
+#   此时"必须为 y"的清单本就不成立，把 FAIL 降级为 WARN，好让构建跑到 ABI 预检
+#   那一步拿到结论（否则 preconfig 直接退非零，白等 20 分钟）。
+RELAX_CONFIG_CHECK="${RELAX_CONFIG_CHECK:-0}"
 REQ_Y="CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS"
 [ "$KSU_ENABLED" = "1" ] && REQ_Y="$REQ_Y KSU"
 for k in $REQ_Y; do
-  grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config" || { say "  [FAIL] CONFIG_$k 不是 y"; FAIL=$((FAIL+1)); }
+  if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
+    :
+  elif [ "$RELAX_CONFIG_CHECK" = "1" ]; then
+    say "  [WARN] CONFIG_$k 不是 y（分组 bisect 模式，允许）"
+  else
+    say "  [FAIL] CONFIG_$k 不是 y"; FAIL=$((FAIL+1))
+  fi
 done
 # ★ ABI 铁律：这几项必须【不是 y】——
 #   NF_TABLES 会给 struct net 加成员、SYSVIPC 会给 struct task_struct 加成员，

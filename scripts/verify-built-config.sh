@@ -164,6 +164,12 @@ fi
 echo
 echo "==== 汇总: PASS=$PASS  FAIL=$FAIL  SKIP=$WARN ===="
 if [ "$FAIL" -ne 0 ]; then
+  if [ "${RELAX_CONFIG_CHECK:-0}" = "1" ]; then
+    # 分组 bisect 模式（FRAGMENT=ns/cgroup/none）：本来就没打算把配置开全，
+    # 这里不阻断，让构建继续跑到 ABI 预检拿到结论。
+    echo "[!] RELAX_CONFIG_CHECK=1（分组 bisect）：$FAIL 项未生效，降级为警告，不阻断。"
+    exit 0
+  fi
   echo
   echo "[!] 有 $FAIL 项没生效。排查顺序："
   echo "    1) 确认改的是 msm-kernel/arch/arm64/configs/gki_defconfig（defconfig 本体），"
