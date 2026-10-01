@@ -9,7 +9,7 @@
 #   FRAGMENT=all|ns|cgroup|none
 #   DEBUG_INFO=on|off 默认 off（16GB runner 的 FULL LTO OOM 对策）
 #
-# --- bisect B：只开 cgroup 组 ---
-KSU=off
-FRAGMENT=cgroup
-DEBUG_INFO=off
+# --- bisect C：完整配置 + DEBUG_INFO 开启（潜在可交付版）---
+KSU=on
+FRAGMENT=all
+DEBUG_INFO=on
