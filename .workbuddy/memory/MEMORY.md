@@ -96,6 +96,25 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
    小写兼容层，写小写会报 `Unable to determine  partition`（两个空格=变量为空）。
    脚本文件名必须是规范小写 `anykernel.sh`（backend 里 `ash anykernel.sh` 写死）。
 
+## A/B 双槽与 vbmeta 实测事实（2026-10-01）
+- 设备是 A/B，活动槽 `_b`。**AK3 的 `IS_SLOT_DEVICE=auto` 会同时写两个槽** ——
+  用户以前用 App 刷 AK3 都是双写，所以 boot_a/boot_b 里常是同一个内核。
+- 只写一个槽（比如我用 dd 只写 boot_b）会让两槽不一致，但**不影响启动判断**：
+  设备只从活动槽启动。
+- **vbmeta 的 flags 在 offset 120，且 AVB 头字段是【大端】**：
+  实测 vbmeta_b flags = 0x00000003 = HASHTREE_DISABLED|VERIFICATION_DISABLED
+  ⇒ **引导校验是关闭的**，所以用 dd / magiskboot 生成的 boot.img 不会被拒；
+  "卡米标"一定是内核自己跑起来后挂住（不是 bootloader 拒载，也不是回退另一槽）。
+- 排查顺序（省时间）：先读 vbmeta flags 确认校验状态 → 再谈镜像/内核。
+
+## 只编 Image 时没有 Module.symvers（重要）
+`Module.symvers` 由 modpost 在为【模块】生成符号版本信息时才产出；
+我们只跑 `make Image`，所以它不存在（Run#7 的 ABI 预检因此报"没测成"而非"不兼容"）。
+替代：**从 vmlinux（ELF，一定存在）解析** `__ksymtab`/`__kcrctab`：
+`scripts/check-abi-crc.py dump-vmlinux <out>/vmlinux -o crcs.txt`
+（5.10 arm64 是 PREL32：3×int32；两表由链接脚本 SORT 保证同序；
+名字必须落在 `__ksymtab_strings*` 节内）。
+
 ## 排查"卡米标"的判据（本次总结）
 - pstore `/sys/fs/pstore/` 空 + dropbox 无 `SYSTEM_LAST_KMSG` + 无 tombstones
   ⇒ **是 hang 不是 panic**，别指望日志；往"启动早期就死"的方向查
