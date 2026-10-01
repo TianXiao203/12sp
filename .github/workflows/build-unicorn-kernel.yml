@@ -323,8 +323,25 @@ jobs:
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
 
+      - name: 读取构建开关（ci/build-flags.txt —— push 触发时的 bisect 通道）
+        run: |
+          set -e
+          F="$GITHUB_WORKSPACE/ci/build-flags.txt"
+          KSU_ENABLED=1
+          if [ -f "$F" ]; then
+            while IFS='=' read -r k v; do
+              case "$k" in ''|\#*) continue;; esac
+              k=$(echo "$k" | tr -d ' \r'); v=$(echo "$v" | tr -d ' \r')
+              [ "$k" = "KSU" ] && KSU_ENABLED=$([ "$v" = "off" ] && echo 0 || echo 1)
+            done < "$F"
+            echo "[i] 构建开关生效: KSU=$([ "$KSU_ENABLED" = "1" ] && echo on || echo off)"
+          else
+            echo "[i] 没有 ci/build-flags.txt，全部用默认值（KSU=on）"
+          fi
+          echo "KSU_ENABLED=$KSU_ENABLED" >> "$GITHUB_ENV"
+
       - name: 写入 Docker/cgroup + ReSukiSU 配置
-        if: ${{ (inputs.build_mode || 'control') != 'control' }}
+        if: ${{ env.IN_MODE != 'control' }}
         run: |
           set -e
           bash "$GITHUB_WORKSPACE/scripts/apply-configs.sh" \
@@ -332,7 +349,7 @@ jobs:
                "$GITHUB_WORKSPACE/configs/docker-cgroup.fragment"
 
       - name: 兜底：确保 ABI 危险项一定不在 defconfig 里
-        if: ${{ (inputs.build_mode || 'control') != 'control' }}
+        if: ${{ env.IN_MODE != 'control' }}
         run: |
           # 这三项会改变【被导出符号可见的结构体布局】，导致 ROM 里预编译的
           # vendor 模块集体拒载 → 卡在米标（详见 configs/docker-cgroup.fragment 开头）。
@@ -352,7 +369,7 @@ jobs:
           grep -nE '^(# )?CONFIG_(NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SYSVIPC|POSIX_MQUEUE|IPC_NS)=' "$DEF" || echo "    （都已不在文件中，即均为 n）"
 
       - name: 集成 ReSukiSU
-        if: ${{ (inputs.build_mode || 'control') != 'control' }}
+        if: ${{ env.IN_MODE != 'control' && env.KSU_ENABLED != '0' }}
         run: |
           set -e
           bash "$GITHUB_WORKSPACE/scripts/integrate-resukisu.sh" \
@@ -368,7 +385,7 @@ jobs:
           echo "::warning::已开 CONFIG_KSU_SUSFS=y；SUSFS 还需按内核版本打 susfs4ksu 内核侧补丁，否则编译会失败。"
 
       - name: 确认本树实际使用的 defconfig 碎片
-        if: ${{ (inputs.build_mode || 'control') != 'control' }}
+        if: ${{ env.IN_MODE != 'control' }}
         run: |
           set -e
           DEF="$WS/common/arch/arm64/configs/gki_defconfig"
@@ -387,7 +404,7 @@ jobs:
           grep -n kernelsu "$WS/common/drivers/Makefile" || true
 
       - name: 预生成合并 defconfig（gki_defconfig + 4 个碎片 + LTO 碎片）
-        if: ${{ (inputs.build_mode || 'control') != 'control' }}
+        if: ${{ env.IN_MODE != 'control' }}
         run: |
           # 脚本自己写日志（PRECONFIG_LOG），失败时会用 ::error:: 发出注解
           # —— 因为 Actions 的 job log 接口需要仓库 admin 权限（匿名 403），
@@ -403,7 +420,7 @@ jobs:
           echo "[OK] .config 已生成：$(ls -l "$WS/out/common/.config")"
 
       - name: 对照模式：直接用设备原版 .config（不集成 KSU、不加任何碎片）
-        if: ${{ (inputs.build_mode || 'control') == 'control' }}
+        if: ${{ env.IN_MODE == 'control' }}
         run: |
           # 目的（Run#10/11 之后的关键裁决实验）：
           #   Run#10/11 的 ABI 预检报 725/1241 符号 CRC 与 ROM vendor 模块不一致，
@@ -701,7 +718,7 @@ jobs:
             build.log
 
       - name: 成功时把 AK3 包推到 ci-artifacts 分支（可匿名 clone，省掉手工下载）
-        if: success() && (inputs.publish_artifacts || 'true') == 'true' && (inputs.build_mode || 'control') != 'control'
+        if: success() && (inputs.publish_artifacts || 'true') == 'true' && env.IN_MODE != 'control'
         continue-on-error: true
         run: |
           # 为什么要这一步：

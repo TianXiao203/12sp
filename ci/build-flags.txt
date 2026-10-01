@@ -1,0 +1,11 @@
+# CI 构建开关（push 触发时的 bisect 通道）
+#
+# 背景：ABI 预检在 Run#10/11 稳定报 725/1241 个符号 CRC 与 ROM vendor 模块
+# 不一致，但配置全量 diff 只有 26 项且无一项影响结构体布局。本文件让
+# push 自动触发的构建也能逐项开关我们的改动，定位差异来源。
+#
+# 格式：KEY=VALUE，支持 # 注释与空行。改完 push 即生效。
+#
+# KSU=on|off   off=跳过 ReSukiSU 集成（不建 drivers/kernelsu、不写 CONFIG_KSU=y），
+#              保留 Docker/cgroup 配置。用于裁决 725 个 CRC 差异是否来自 KSU。
+KSU=off

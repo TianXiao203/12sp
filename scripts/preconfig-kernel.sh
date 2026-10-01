@@ -284,7 +284,12 @@ for k in CGROUP_DEVICE CGROUP_PIDS CGROUP_FREEZER CGROUP_SCHED CPUSETS MEMCG BLK
   line=$(grep -E "^CONFIG_${k}=|^# CONFIG_${k} is not set" "$OUT_ABS/.config" | tail -1)
   printf '  %-24s %s\n' "CONFIG_$k" "${line:-<符号行不存在>}"
 done
-for k in CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS KSU; do
+# KSU 可选：ci/build-flags.txt 里 KSU=off 时（KSU_ENABLED=0）不集成 ReSukiSU，
+# CONFIG_KSU 不会是 y —— 此时不能把它列进"必须为 y"的清单。
+KSU_ENABLED="${KSU_ENABLED:-1}"
+REQ_Y="CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS"
+[ "$KSU_ENABLED" = "1" ] && REQ_Y="$REQ_Y KSU"
+for k in $REQ_Y; do
   grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config" || { say "  [FAIL] CONFIG_$k 不是 y"; FAIL=$((FAIL+1)); }
 done
 # ★ ABI 铁律：这几项必须【不是 y】——

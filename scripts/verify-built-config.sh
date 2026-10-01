@@ -59,8 +59,16 @@ CONFIG_SECCOMP
 CONFIG_SECCOMP_FILTER
 CONFIG_CGROUP_BPF
 CONFIG_BPF_SYSCALL
+"
+
+# KSU 可选：ci/build-flags.txt 里 KSU=off 时（KSU_ENABLED=0）不集成 ReSukiSU，
+# 此时 CONFIG_KSU 本来就不该是 y，不能算 FAIL。
+KSU_ENABLED="${KSU_ENABLED:-1}"
+if [ "$KSU_ENABLED" = "1" ]; then
+  REQUIRED_Y="$REQUIRED_Y
 CONFIG_KSU
 "
+fi
 
 # ★ 绝对不能为 y 的项（ABI 铁律）★
 #   它们会改变【被导出符号可见的结构体布局】，让内核算出的符号 CRC 与
