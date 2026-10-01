@@ -33,13 +33,13 @@ on:
         required: true
         default: 'ef362912d37b761041709638c1e571d6394e9558'
       clang_version:
-        description: 'clang 版本（默认与内核树 build.config.common 一致；报 clang 错误就换成 clang-r563880）'
+        description: '⚠️ 必须与 ROM 里 vendor 模块用的编译器一致（CFI 类型哈希由编译器决定）。设备实测 clang 21.0.0 / r563880c'
         required: true
-        default: 'clang-r416183b'
+        default: 'clang-r563880c'
         type: choice
         options:
+          - clang-r563880c
           - clang-r416183b
-          - clang-r563880
       device:
         description: '设备代号（小米 12S Pro = unicorn）'
         required: true
@@ -456,6 +456,25 @@ jobs:
           echo "本次构建 release  : ${REL:-<取不到>}"
           echo "内核树 .scmversion : $(cat "$WS/common/.scmversion" 2>/dev/null || echo '<不存在>')"
           echo "CONFIG_LOCALVERSION: $(grep -m1 '^CONFIG_LOCALVERSION=' "$WS/out/common/.config" 2>/dev/null || echo '<取不到>')"
+
+          # ---------- 编译器一致性（这次卡开机 logo 的真凶）----------
+          # ROM 里的 vendor_dlkm 模块是用官方那套 clang 编的；我们开了 CONFIG_CFI_CLANG=y，
+          # 而 CFI 的【类型哈希由编译器算出来】。clang 版本不同 → 哈希不同 →
+          # 内核与 vendor 模块对不上 → 控制台还没起来就出事，表现为【卡在开机 logo】。
+          CLANGV="$(grep -m1 '^CONFIG_CLANG_VERSION=' "$WS/out/common/.config" 2>/dev/null || true)"
+          CCTXT="$(grep -m1 '^CONFIG_CC_VERSION_TEXT=' "$WS/out/common/.config" 2>/dev/null || true)"
+          echo "编译器           : ${CLANGV:-<取不到>}"
+          echo "                 : ${CCTXT:-<取不到>}"
+          case "$CLANGV" in
+            CONFIG_CLANG_VERSION=210000)
+              echo "::notice title=编译器一致:: clang 21 / r563880c，与设备内核相同，CFI 类型哈希可匹配" ;;
+            *)
+              echo "::error title=编译器不一致::本次=$CLANGV  设备=CONFIG_CLANG_VERSION=210000（clang 21 / r563880c）"
+              echo "::error::${CCTXT:-<取不到 CC_VERSION_TEXT>}"
+              echo "::error::clang 版本不同会让 CFI 类型哈希对不上；刷进去会【卡在开机 logo】。先别刷。"
+              echo "::error::把 clang_version 改成 clang-r563880c 重新构建。" ;;
+          esac
+
           if [ "$REL" = "$EXPECTED_RELEASE" ]; then
             echo "::notice title=版本串一致:: ${REL}  -> 只需刷 boot.img / AK3，ROM 里现成的 vendor 模块可直接加载"
           else

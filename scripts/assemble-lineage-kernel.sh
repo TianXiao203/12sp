@@ -129,23 +129,71 @@ fi
 # ---------------------------------------------------------------------------
 echo "[assemble] clang 版本: $CLANG_VER"
 
+# 为什么 clang 版本必须和设备内核一致：
+#   ROM 里预装的 vendor_dlkm 模块是用【官方那套 clang】编的，而我们启用了
+#   CONFIG_CFI_CLANG=y —— CFI 的【类型哈希是编译器算出来的】，clang 版本不同
+#   哈希就不同。内核与 vendor 模块哈希对不上 → 早期间接调用触发 CFI 失败
+#   → 控制台还没起来，表现为**卡在开机 logo**（不是 panic 提示）。
+#   实测：设备内核 = clang 21.0.0 / r563880c（build 14054515），我们曾用 clang 12
+#   编出来 → 刷进去卡 logo；两个内核的 Linux version 串完全一样，只有编译器不同。
+#
+# 获取顺序（每个都校验 bin/clang 是否存在）：
+#   1. LineageOS 的 kernel-clang 仓库（老版本如 r416183b 在这里）
+#   2. bluegreensea 的 kernel-clang 镜像（已验证含 bin/clang、ld.lld 与全套 llvm 工具，
+#      且 manifest_14054515.xml 的 build 号与设备内核串完全一致）
+#   3. AOSP googlesource 的目录归档（GitHub runner 上通常可达）
+#   4. codeload 的 tar.gz（镜像仓库的归档，不依赖 git 对象历史）
+try_clang_repo() {
+  local url="$1" br="${2:-}"
+  log "尝试 clang 源: $url ${br:+(-b $br)}"
+  rm -rf "$CLANG_DIR"
+  if [ -n "$br" ]; then
+    git clone --depth=1 -b "$br" "$url" "$CLANG_DIR" 2>/dev/null
+  else
+    git clone --depth=1 "$url" "$CLANG_DIR" 2>/dev/null
+  fi
+  [ -x "$CLANG_DIR/bin/clang" ]
+}
+
 if [ ! -x "$CLANG_DIR/bin/clang" ]; then
-  clone_repo "https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER" \
-             "$CLANG_DIR" "" "--depth=1" || true
+  CLANG_MIRRORS="
+https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER
+https://github.com/bluegreensea/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER
+"
+  for m in $CLANG_MIRRORS; do
+    if try_clang_repo "$m"; then echo "[assemble][OK] clang 来自 $m"; break; fi
+  done
 fi
 
-# 回退：从 AOSP googlesource 直接取该版本目录的 tar.gz（LineageOS 没有对应仓库时用）
 if [ ! -x "$CLANG_DIR/bin/clang" ]; then
-  warn "LineageOS 侧没有 $CLANG_VER 仓库，改从 android.googlesource.com 取目录归档"
+  warn "上面的 git 源都不可用，改从 android.googlesource.com 取目录归档"
   mkdir -p "$CLANG_DIR"
   URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/$CLANG_VER.tar.gz"
-  if curl -fL --retry 3 -m 1800 "$URL" | tar xz -C "$CLANG_DIR" 2>/dev/null; then
-    echo "[assemble] tar 方式获取 clang 成功"
-  else
-    warn "clang 获取失败。可用的 LineageOS clang 仓库（已确认存在）:"
-    warn "  https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b"
-    warn "  或改用 clang_version=clang-r563880（设备内核实际使用的版本）"
+  if curl -fL --retry 3 -m 1800 "$URL" | tar xz -C "$CLANG_DIR" 2>/dev/null && [ -x "$CLANG_DIR/bin/clang" ]; then
+    echo "[assemble][OK] tar 方式获取 clang 成功"
   fi
+fi
+
+if [ ! -x "$CLANG_DIR/bin/clang" ]; then
+  warn "最后尝试 codeload 的 tar.gz（镜像仓库归档）"
+  rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
+  for br in main master; do
+    URL="https://codeload.github.com/bluegreensea/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER/tar.gz/refs/heads/$br"
+    if curl -fL --retry 3 -m 1800 "$URL" | tar xz -C "$CLANG_DIR" --strip-components=1 2>/dev/null \
+       && [ -x "$CLANG_DIR/bin/clang" ]; then
+      echo "[assemble][OK] codeload 方式获取 clang 成功 ($br)"; break
+    fi
+  done
+fi
+
+if [ ! -x "$CLANG_DIR/bin/clang" ]; then
+  warn "clang 获取失败！可用来源："
+  warn "  https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b"
+  warn "  https://github.com/bluegreensea/android_prebuilts_clang_kernel_linux-x86_clang-r563880c"
+  warn "  （clang-r563880c 是设备内核实际使用的版本，见上面的说明）"
+else
+  echo "[assemble] clang 实际版本："
+  "$CLANG_DIR/bin/clang" --version 2>&1 | head -2 | sed 's/^/[assemble]   /'
 fi
 
 # 把内核树里写死的 CLANG_PREBUILT_BIN 改成实际使用的版本

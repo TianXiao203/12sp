@@ -361,6 +361,39 @@ ls -lh out/target/product/unicorn/boot.img
 | 18~19 | 打包 / 上传 | 生成 `anykernel3-unicorn.zip` |
 | 22 | 失败时推 `ci-diag` | 把 `build.log` 等诊断推到独立分支，**可匿名 clone**（见下） |
 
+#### ⚠️⚠️ clang 版本也必须与设备内核一致（否则刷进去卡开机 logo）
+
+**这条是 2026-10-01 用两台内核实测出来的，代价是一次刷机 + 一次 fastboot 救砖。**
+
+我们已经开了 `CONFIG_CFI_CLANG=y`，而 **CFI 的类型哈希是编译器算出来的**。
+ROM 里预装的 `vendor_dlkm` 模块是用**官方那套 clang** 编的；内核如果换了别的
+clang 版本，哈希就对不上 → 内核与 vendor 模块之间的间接调用在**控制台还没
+初始化时就出事** → 表现为**卡在开机 logo，屏幕上没有任何报错**
+（不是 panic 提示，所以 pstore 里也什么都没有）。
+
+实测证据（两个内核的 `Linux version` 串完全一样，只有编译器不同）：
+
+| | 编译器 |
+|---|---|
+| 设备上能启动的内核 | `clang version 21.0.0`（Android 14054515, based on **r563880c**） |
+| 我们用 r416183b 编的 | `clang version 12.0.5` ← 刷进去卡 logo |
+
+**所以 `clang_version` 必须选 `clang-r563880c`**（工作流默认值已改）。
+这个版本由 `assemble-lineage-kernel.sh` 从下面这几处按顺序取（都校验 `bin/clang`）：
+
+1. `LineageOS/android_prebuilts_clang_kernel_linux-x86_<版本>`（老版本如 r416183b 在这）
+2. `bluegreensea/android_prebuilts_clang_kernel_linux-x86_<版本>`（镜像；
+   已验证含 `bin/clang`、`ld.lld` 与全套 llvm 工具，其 `manifest_14054515.xml`
+   的 build 号与设备内核串**完全一致**）
+3. AOSP `android.googlesource.com` 的目录归档
+4. `codeload` 的 tar.gz（不依赖 git 历史）
+
+工作流第 18 步会核对 `CONFIG_CLANG_VERSION` 是否为 `210000`，不一致就发
+`::error::` 注解并**明确提示先别刷**。
+
+> 交叉验证：**CFI 的约束在 Kconfig 里只要求 `LTO_CLANG`**（thin / full 都合法，
+> 见 `arch/Kconfig:719-721`），所以 LTO 模式不是硬约束；真正决定哈希的是编译器。
+
 #### ⚠️ 版本串必须精确一致（这条决定刷了之后 Wi-Fi 还在不在）
 
 目标值：**`5.10.260-gki-gef362912d37b`**

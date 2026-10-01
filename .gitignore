@@ -32,3 +32,8 @@ remote.py
 # Python 字节码
 __pycache__/
 *.pyc
+
+# 本地产出的 boot 镜像与备份（很大，绝不入库）
+boot-unicorn-custom.img
+boot_b_backup.img
+*.img
