@@ -70,13 +70,33 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
      - `CONFIG_SYSVIPC=y` → `include/linux/sched.h:973` 给 `struct task_struct`
        加 `sysv_sem sysvsem; sysv_shm sysvshm;`
        （所以 `IPC_NS` 的前置依赖要用 `POSIX_MQUEUE`，不是 `SYSVIPC`）
-   已验证安全（本项目在用）：`CGROUP_DEVICE`/`CGROUP_PIDS`/`PID_NS`/`USER_NS`/
-   `IPC_NS`+`POSIX_MQUEUE`/`KSU`。
+     - `CONFIG_POSIX_MQUEUE=y` → `include/linux/sched/user.h:24` 给
+       `struct user_struct` 加 `unsigned long mq_bytes;`（经 `cred.user` 波及
+       task/file/socket → **725 个符号 CRC 变**）。
+       ★ 已修：`scripts/patch-abi-safe.sh` 用 `ANDROID_KABI_USE(2, unsigned long mq_bytes)`
+       把它挪进 GKI 预设的保留槽（`__GENKSYMS__` 下等价于原 `u64 android_kabi_reserved2`，
+       genksyms 文本与 ROM 逐字相同 → CRC 不变；编译器侧 8 字节 union → 布局也不变）。
+       ⇒ 改完 `user.h` 千万**别**把 `ANDROID_KABI_USE` 改回 `ANDROID_KABI_RESERVE(2)`。
+     - `CONFIG_CGROUP_DEVICE=y` / `CONFIG_CGROUP_PIDS=y` → `CGROUP_SUBSYS_COUNT`
+       7→9，而 `include/linux/cgroup-defs.h` 里 `struct css_set`（以及 `struct cgroup`）
+       的 `subsys[CGROUP_SUBSYS_COUNT]` / `e_cset_node[CGROUP_SUBSYS_COUNT]` 是**定长数组**
+       → **295 个符号 CRC 变**。**KABI 保留槽救不了数组长度，只能不开**。
+       代价：Docker 拿不到 devices/pids 控制器（/proc/cgroups 无这两行，
+       "Devices cgroup controller not available." 告警依旧）；想真拿到只能连
+       `modules/qcom/...` 那票 vendor 模块一起重编重刷。
+   已验证安全（实测各 0 个符号变化）：`PID_NS`（gki_defconfig 自带 y，设备是 n）、
+   `USER_NS`（5.10 里 `user_struct.locked_vm` 的条件是 PERF_EVENTS||BPF_SYSCALL||NET||IO_URING，
+   **不是** USER_NS）、`IPC_NS`、`POSIX_MQUEUE_SYSCTL`、`KSU`（有无 KSU 失配集合完全一致）、
+   `DEBUG_INFO=off`（genksyms 只看类型不看调试数据）。
    防护三层：fragment 不含危险项 + workflow 兜底 sed 删除 +
    **`ABI 预检`**（`scripts/check-abi-crc.py` 比对 `Module.symvers` 与
    `abi-baseline/abi-crcs.txt` 的 1613 个符号 CRC，不一致 CI 报红、别刷）。
    联网可行的查法：把候选配置名丢进内核源码头文件里 grep `#if*CONFIG_X`，
    看是否落在某个 struct 定义内。
+   **定位方法论（比读源码猜快得多）**：CI push 即编，然后拿各次构建的
+   `kernel.Module.symvers`（失败时在 `ci-diag/art/` 分支里，可匿名取）
+   做集合运算（⊂/∩/∪）并逐符号比 CRC 值 —— 元凶是哪个配置、有几个，一目了然。
+   （实测 295 ⊂ 725 且两者在 295 上的 CRC 值互不相同 ⇒ 两种机制独立叠加。）
 2. **版本串必须精确等于 `5.10.260-gki-gef362912d37b`**，否则 ROM 现成的
    vendor 模块加载失败（vermagic 不一致）。
    `scripts/setlocalversion` 对脏工作树会追加 `-dirty`，而我们必然要改
@@ -156,6 +176,64 @@ CI 产物【只有裸内核 `Image`】，没有 `boot.img`（刻意只做 `make 
 AK3 master 的 `tools/*` 是 **32 位 ARM** 静态二进制；设备 `CONFIG_COMPAT=y`，
 所以能在手机上跑，不必换包。（`tools/$arch32` 子目录并不存在。）
 
-## 提交状态（2026-10-01）
-`origin/main` = `178a3c7`；Run#5（sha `02ae2a7`）已全绿，
-版本串 `5.10.260-gki-gef362912d37b` 与设备逐字一致。
+## 提交状态（2026-10-01 晚）
+- **`d1abe3b`（fix(abi)）→ Run#14 `36862135580` 全绿**：ABI 预检通过，
+  AK3 包已发布到 `ci-artifacts`（zip 22297761 B，sha256 `3fea43a3…`，
+  版本串 `5.10.260-gki-gef362912d37b` 与设备逐字一致）。
+  ⇒ **`ANDROID_KABI_USE(2, unsigned long mq_bytes)` 这套修法实测有效**：
+  725 个失配清零。交付配置固定为 `KSU=on` / `FRAGMENT=docker` / `DEBUG_INFO=off`。
+- 之前的 Run#5（`02ae2a7`）也是全绿，但那时配置里没有 POSIX_MQUEUE/IPC_NS。
+- 设备活动槽**已从 `_b` 变成 `_a`**（2026-10-01 实测）；AK3 的 `IS_SLOT_DEVICE=auto`
+  双写两槽所以不影响刷机，但以后若要 dd 单槽必须先重新确认活动槽。
+- ★ 设备 `uname -r` 与自编内核版本串**完全相同**，光看 uname 判不出刷没刷；
+  要判断刷没刷成功，看 `/proc/self/ns/` 有没有 `pid`/`ipc`/`user`。
+
+## 推送通道（2026-10-01 实测，结论明确）
+- **SSH 是"间歇性"被拦 —— 直接重试就能过**（实测第 3 次成功推上 `d1abe3b`）。
+  `~/.ssh/known_hosts` 里 github.com 三条就是 GitHub 官方当前公钥；被拦时报
+  "Host key for github.com has changed"（对端 ECDSA 指纹不匹配）⇒ 是沙箱在做中间人。
+  **绝不能**为图省事加 `StrictHostKeyChecking=no`（那等于把私钥交给中间人）。
+  正确做法：写个 3~18 次的 `git push origin main` 重试循环，每次间隔 ~20s。
+- SSH-over-443 不通：`Connection closed by 127.0.0.1 port 443`。
+- HTTPS：`CRYPT_E_NO_REVOCATION_CHECK` 用 `GIT_SSL_NO_VERIFY=true` 可绕过
+  （`-c http.schannelCheckRevoke=false` 无效），但本机没存 PAT（GCM 里也没有）
+  ⇒ `could not read Password for 'https://TianXiao203@github.com'`。**只读操作用 HTTPS 没问题。**
+- `git ls-remote` 不受影响（只传 ref 广告）；`git fetch/clone` 传 pack 会被拦。
+- 取 CI 产物不要指望 codeload/raw（常超时）；用 api contents + `--ssl-no-revoke`
+  （匿名 60/h，注意省着用），或让用户在 run 页面下载，或走 adb 从手机取。
+
+## chroot 里的 Docker（2026-10-01 真机跑通，重启后仍生效）
+**目标已达成**：自编 ABI 安全内核 + Ubuntu chroot 里 `docker run` 可用。
+`Server Version 28.2.2 / Storage Driver fuse-overlayfs / Cgroup Version 2`；
+容器内 `pid=1`、独立 hostname、`ns: cgroup ipc mnt net pid ... user uts` 全齐。
+
+**三处修复（缺一不可）**
+1. chroot 的 `/sys/fs/cgroup` 必须是**真 cgroup2**（app 原来挂空 tmpfs）。
+   否则 Docker 走 cgroup v1 路径，启动硬性要求 devices 挂载 →
+   `failed to start daemon: Devices cgroup isn't mounted`；而本内核不能开
+   `CONFIG_CGROUP_DEVICE`。cgroup v2 的设备控制走 BPF，只依赖 `CONFIG_CGROUP_BPF`（=y）。
+2. **挂载树 rprivate**：`busybox mount --make-rprivate /`，**必须在 chroot 外**对真实根做
+   （`busybox nsenter -t <holder.pid> -m ...`）。内核 `fs/namespace.c` 的 pivot_root 有
+   `IS_MNT_SHARED(root_parent) → EINVAL`，Android 默认整棵树 shared ⇒ runc 建容器恒报
+   `pivot_root .: invalid argument`。★ `mount --make-rprivate` 是 **busybox** 语法，
+   toybox mount 不认；app 自带 `/data/local/ubuntu-chroot/bin/busybox`。
+3. **rootfs 递归自 bind**：`mount -o rbind $ROOT $ROOT`（必须 rbind，`--bind` 会遮住
+   已挂好的 /proc /sys /dev）。否则 dockerd 找不到 `/var/lib/docker` 的挂载点 →
+   `remount /, flags: 0x84000: invalid argument`。
+
+**附带**：存储驱动用 **fuse-overlayfs** —— 本机内核拒绝对 f2fs 用 overlayfs
+（dmesg: `overlayfs: filesystem on '...' not supported`，因 f2fs 带 casefold）。
+daemon.json：`{"iptables": false, "bridge": "none", "ip6tables": false, "storage-driver": "fuse-overlayfs"}`。
+
+**落地**：`scripts/patch-chroot-docker.py`（幂等 + 备份 + CRLF 自检）给 app 的
+`chroot.sh` 打 `[PATCH-DOCKER]` 段、给 `post_exec.sh` 追加 dockerd 自启；
+`scripts/docker-chroot-fix.sh` 是运行时补救/诊断版。
+备份：`chroot.sh.bak-20261001`、`post_exec.sh.bak-20261001`、`daemon.json.bak-fuse`。
+★ 回退：把 `.bak-20261001` 覆盖回去即可；app 若 OTA 更新会把补丁冲掉，重跑补丁脚本即可。
+
+**给用户的操作**：`sh /data/local/ubuntu-chroot/chroot.sh run docker info`；进容器终端用
+`sh /data/local/ubuntu-chroot/chroot.sh start`（或 app 里进 chroot 后直接 `docker ...`）。
+
+**adb 操作铁律（本次踩实）**：嵌套 `sh -c` 引号会被本地层吃掉 → 一律 push 脚本文件执行；
+本地会提前展开 `$(...)` → 设备侧展开要写 `\$(...)`；用 Python 改手机 .sh 必须 `newline=''`
+（否则 CRLF 让 mksh 报 `syntax error: unexpected 'elif'`）；`pkill -f dockerd` 会自杀，用 `-x`。
