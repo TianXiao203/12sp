@@ -16,6 +16,17 @@ name: Build unicorn kernel (LineageOS + ReSukiSU + Docker cgroups)
 # =============================================================================
 
 on:
+  # 额外允许 push 自动触发：只对影响构建产物的文件生效（改文档/记忆不会触发）。
+  # 这样不需要人工点 Run workflow 也能出包；inputs 为空时用 env 里的默认值。
+  push:
+    branches: [main]
+    paths:
+      - 'configs/**'
+      - 'scripts/**'
+      - 'anykernel3/**'
+      - 'abi-baseline/abi-crcs.txt'
+      - '.github/workflows/build-unicorn-kernel.yml'
+
   workflow_dispatch:
     inputs:
       lineage_branch:
@@ -120,17 +131,19 @@ jobs:
       # 注意：WS 不在这里写死，由第一步「选择构建工作区」动态决定（优先 /mnt，
       # 那里默认有 ~74GB 空闲，而 / 只剩 ~14GB）。写在 job env 里会覆盖 GITHUB_ENV，
       # 所以必须留空。
-      IN_BRANCH: ${{ inputs.lineage_branch }}
-      IN_COMMIT: ${{ inputs.kernel_commit }}
-      IN_CLANG: ${{ inputs.clang_version }}
-      IN_DEVICE: ${{ inputs.device }}
-      IN_VARIANT: ${{ inputs.variant }}
-      IN_KSU_BRANCH: ${{ inputs.resukisu_branch }}
-      IN_KSU_HOOK: ${{ inputs.resukisu_hook }}
-      IN_ENABLE_SUSFS: ${{ inputs.enable_susfs }}
-      IN_SUSFS: ${{ inputs.enable_susfs }}
-      IN_FREE_DISK: ${{ inputs.free_disk }}
-      IN_SWAP: ${{ inputs.enable_swap }}
+      # 下面统一用 `inputs.x || 默认值`：手动触发时用表单值，
+      # push 自动触发时（inputs 为空）也能拿到正确默认值。
+      IN_BRANCH: ${{ inputs.lineage_branch || 'lineage-23.2' }}
+      IN_COMMIT: ${{ inputs.kernel_commit || 'ef362912d37b761041709638c1e571d6394e9558' }}
+      IN_CLANG: ${{ inputs.clang_version || 'clang-r563880c' }}
+      IN_DEVICE: ${{ inputs.device || 'unicorn' }}
+      IN_VARIANT: ${{ inputs.variant || 'gki' }}
+      IN_KSU_BRANCH: ${{ inputs.resukisu_branch || 'main' }}
+      IN_KSU_HOOK: ${{ inputs.resukisu_hook || 'kprobes' }}
+      IN_ENABLE_SUSFS: ${{ inputs.enable_susfs || 'false' }}
+      IN_SUSFS: ${{ inputs.enable_susfs || 'false' }}
+      IN_FREE_DISK: ${{ inputs.free_disk || 'false' }}
+      IN_SWAP: ${{ inputs.enable_swap || 'true' }}
       # 设备实测 uname -r，用于校验 vermagic 是否一致
       EXPECTED_RELEASE: '5.10.260-gki-gef362912d37b'
 
@@ -325,7 +338,7 @@ jobs:
                "$WS/common" "$IN_KSU_BRANCH" "$IN_KSU_HOOK"
 
       - name: 按需开启 SUSFS
-        if: ${{ inputs.enable_susfs == 'true' }}
+        if: ${{ (inputs.enable_susfs || 'false') == 'true' }}
         run: |
           set -e
           DEF="$WS/common/arch/arm64/configs/gki_defconfig"
@@ -565,7 +578,7 @@ jobs:
             build.log
 
       - name: 成功时把 AK3 包推到 ci-artifacts 分支（可匿名 clone，省掉手工下载）
-        if: success() && inputs.publish_artifacts == 'true'
+        if: success() && (inputs.publish_artifacts || 'true') == 'true'
         continue-on-error: true
         run: |
           # 为什么要这一步：
@@ -678,7 +691,7 @@ jobs:
           path: diag/**
 
       - name: 失败时把完整日志推到 ci-diag 分支（可匿名读取，用于远程排错）
-        if: failure() && inputs.push_diag_branch == 'true'
+        if: failure() && (inputs.push_diag_branch || 'true') == 'true'
         continue-on-error: true
         run: |
           # 为什么要推分支：
