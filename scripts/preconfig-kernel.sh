@@ -300,6 +300,13 @@ KSU_ENABLED="${KSU_ENABLED:-1}"
 #   那一步拿到结论（否则 preconfig 直接退非零，白等 20 分钟）。
 RELAX_CONFIG_CHECK="${RELAX_CONFIG_CHECK:-0}"
 REQ_Y="CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS"
+# docker 模式（最终交付配置）刻意【不开】CGROUP_DEVICE / CGROUP_PIDS：
+#   CGROUP_SUBSYS_COUNT 7→9 会改 struct css_set / struct cgroup 的定长数组，
+#   KABI 保留槽救不了数组长度，只能不开。详见 patch-abi-safe.sh 顶部说明。
+if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
+  REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS"
+  say "[i] FRAGMENT=docker：不要求 CGROUP_DEVICE/CGROUP_PIDS（会破坏 ABI）"
+fi
 [ "$KSU_ENABLED" = "1" ] && REQ_Y="$REQ_Y KSU"
 for k in $REQ_Y; do
   if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
@@ -320,6 +327,15 @@ for k in NF_TABLES NF_TABLES_BRIDGE SYSVIPC; do
     FAIL=$((FAIL+1))
   fi
 done
+# 同理（bisect 实锤各 295 个符号 CRC 变化）：docker 交付配置里必须没有这两项。
+if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
+  for k in CGROUP_DEVICE CGROUP_PIDS; do
+    if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
+      say "  [FAIL] CONFIG_$k=y —— 会改 struct css_set 定长数组，ABI 与 ROM 模块不兼容"
+      FAIL=$((FAIL+1))
+    fi
+  done
+fi
 WANT_LTO=$([ "$LTO_MODE" = "thin" ] && echo LTO_CLANG_THIN || echo LTO_CLANG_FULL)
 if ! grep -q "^CONFIG_${WANT_LTO}=y$" "$OUT_ABS/.config"; then
   say "  [FAIL] LTO 不是 $WANT_LTO（期望 LTO_MODE=$LTO_MODE）"

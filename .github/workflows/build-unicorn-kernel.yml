@@ -325,6 +325,29 @@ jobs:
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
 
+      - name: ABI 安全补丁（user_struct.mq_bytes 挪进 KABI 保留槽）
+        if: ${{ env.IN_MODE != 'control' }}
+        run: |
+          # 为什么需要它：
+          #   Docker 的 IPC namespace 需要 CONFIG_IPC_NS，而 IPC_NS
+          #   depends on (SYSVIPC || POSIX_MQUEUE)。SYSVIPC 会给 task_struct
+          #   加 sysvsem/sysvshm（更致命），只能选 POSIX_MQUEUE；
+          #   但 POSIX_MQUEUE 会给 struct user_struct 加一个 mq_bytes 成员
+          #   → 经 cred.user 波及 task/file/socket → 725 个符号 CRC 变。
+          #   而 Android GKI 的 user_struct 本来就有两个 8 字节 KABI 保留槽，
+          #   用 ANDROID_KABI_USE 把 mq_bytes 放进保留槽后：
+          #     genksyms 看到的文本仍是 u64 android_kabi_reserved2（与 ROM 逐字相同）
+          #     → CRC 不变；实际布局也仍是 8 字节 → 布局真的没变。
+          set -e
+          bash "$GITHUB_WORKSPACE/scripts/patch-abi-safe.sh" "$WS/common" \
+            2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          if ! grep -qE 'ANDROID_KABI_USE\(2, *unsigned long +mq_bytes\)' \
+                "$WS/common/include/linux/sched/user.h"; then
+            echo "::error title=ABI 补丁没生效::user_struct 里没看到 ANDROID_KABI_USE(2, unsigned long mq_bytes)，编出来会与 ROM 模块不兼容（卡米标），先别刷。"
+            exit 1
+          fi
+          echo "::notice title=ABI 补丁已应用::user_struct.mq_bytes 走 android_kabi_reserved2，CRC 与 ROM 一致"
+
       - name: 读取构建开关（ci/build-flags.txt —— push 触发时的 bisect 通道）
         run: |
           set -e
@@ -355,7 +378,7 @@ jobs:
             bash "$GITHUB_WORKSPACE/scripts/filter-fragment.sh" "$FRAG_SRC" "$FRAGMENT_MODE" "$FRAG_FILE"
           fi
           # KSU 关闭时把 KSU 配置项从碎片里剔掉（否则 .config 里会留下 CONFIG_KSU=y）
-          if [ "$KSU_ENABLED" = "0" ] && [ "$FRAGMENT_MODE" = "all" ]; then
+          if [ "$KSU_ENABLED" = "0" ]; then
             mkdir -p "$GITHUB_WORKSPACE/.ci-fragment"
             NK="$GITHUB_WORKSPACE/.ci-fragment/docker-noksu.fragment"
             grep -vE '^(# )?CONFIG_KSU' "$FRAG_FILE" > "$NK"
@@ -366,13 +389,14 @@ jobs:
           echo "KSU_ENABLED=$KSU_ENABLED"    >> "$GITHUB_ENV"
           echo "FRAGMENT_MODE=$FRAGMENT_MODE" >> "$GITHUB_ENV"
           echo "DEBUG_INFO_OFF=$DEBUG_INFO_OFF" >> "$GITHUB_ENV"
-          # 分组模式（非 all）时 preconfig/verify 的"必须为 y"清单不再适用，
-          # 降级为警告，否则会在 preconfig 阶段就失败、拿不到 ABI 结论。
-          if [ "$FRAGMENT_MODE" = "all" ]; then
-            echo "RELAX_CONFIG_CHECK=0" >> "$GITHUB_ENV"
-          else
-            echo "RELAX_CONFIG_CHECK=1" >> "$GITHUB_ENV"
-          fi
+          # 分组模式（ns/userns/ipc/cgroup/none）只开一部分配置，
+          # preconfig/verify 的"必须为 y"清单不再适用 → 降级为警告，
+          # 否则会在 preconfig 阶段就失败、拿不到 ABI 结论。
+          # all 与 docker 是【完整】配置，照常严格校验。
+          case "$FRAGMENT_MODE" in
+            all|docker) echo "RELAX_CONFIG_CHECK=0" >> "$GITHUB_ENV" ;;
+            *)          echo "RELAX_CONFIG_CHECK=1" >> "$GITHUB_ENV" ;;
+          esac
 
       - name: 写入 Docker/cgroup + ReSukiSU 配置
         if: ${{ env.IN_MODE != 'control' }}
@@ -385,22 +409,33 @@ jobs:
       - name: 兜底：确保 ABI 危险项一定不在 defconfig 里
         if: ${{ env.IN_MODE != 'control' }}
         run: |
-          # 这三项会改变【被导出符号可见的结构体布局】，导致 ROM 里预编译的
-          # vendor 模块集体拒载 → 卡在米标（详见 configs/docker-cgroup.fragment 开头）。
+          # 下面几项会改变【被导出符号可见的结构体布局】，导致 ROM 里预编译的
+          # vendor 模块集体拒载 → 卡在米标（详见 configs/docker-cgroup.fragment 开头）：
           #   NF_TABLES        -> struct net 多一个成员（net_namespace.h:145）
           #   SYSVIPC          -> struct task_struct 多两个成员（sched.h:973）
           #   BRIDGE_NETFILTER -> 与 net 路径相关，一并回避
+          # 实测还有两项（bisect 已实锤，各让 295 个符号 CRC 变化）：
+          #   CGROUP_DEVICE / CGROUP_PIDS
+          #     -> CGROUP_SUBSYS_COUNT 7→9，而 struct css_set / struct cgroup 里
+          #        subsys[CGROUP_SUBSYS_COUNT] / e_cset_node[...] 是【定长数组】，
+          #        没有任何 KABI 保留槽手段能补数组长度 → 只能不开。
+          #        （代价：Docker 拿不到 devices/pids 控制器，会有那条 WARN。）
           # 这里做一次硬兜底，防止以后有人手滑把它加回 fragment。
+          # 例外：FRAGMENT_MODE=cgroup 的 bisect 通道需要它们来复现 295 失配。
           set -e
           DEF="$WS/common/arch/arm64/configs/gki_defconfig"
-          for k in CONFIG_NF_TABLES CONFIG_NF_TABLES_BRIDGE CONFIG_BRIDGE_NETFILTER CONFIG_SYSVIPC; do
+          KILL="CONFIG_NF_TABLES CONFIG_NF_TABLES_BRIDGE CONFIG_BRIDGE_NETFILTER CONFIG_SYSVIPC"
+          if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
+            KILL="$KILL CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS"
+          fi
+          for k in $KILL; do
             if grep -qE "^${k}=" "$DEF"; then
               echo "[WARN] $DEF 里出现了 $k，正在移除（它会让 ABI 与 ROM 模块不兼容）"
               sed -i "/^${k}=/d; /^# ${k} is not set/d" "$DEF"
             fi
           done
           echo "[+] 检查完毕，当前 gki_defconfig 里这几项的状态："
-          grep -nE '^(# )?CONFIG_(NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SYSVIPC|POSIX_MQUEUE|IPC_NS)=' "$DEF" || echo "    （都已不在文件中，即均为 n）"
+          grep -nE '^(# )?CONFIG_(NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SYSVIPC|CGROUP_DEVICE|CGROUP_PIDS|POSIX_MQUEUE|IPC_NS|USER_NS|PID_NS)=' "$DEF" || echo "    （都已不在文件中，即均为 n）"
 
       - name: 集成 ReSukiSU
         if: ${{ env.IN_MODE != 'control' && env.KSU_ENABLED != '0' }}

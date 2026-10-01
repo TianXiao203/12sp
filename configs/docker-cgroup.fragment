@@ -35,27 +35,67 @@
 #                             #ifdef CONFIG_SYSVIPC ... struct sysv_sem sysvsem; struct sysv_shm sysvshm;
 #                             struct task_struct 多两个成员，影响面更大
 #
-#   下面这些【已验证是布局安全】的（它们只影响内核自身的实现，不改任何
-#   被导出符号可见的结构体）：
-#     CGROUP_DEVICE / CGROUP_PIDS（只加内部 cgroup 子系统）
-#     PID_NS（struct pid_namespace 无条件定义，无条件成员）
-#     USER_NS（struct cred.user_ns 等本来就是无条件字段）
-#     IPC_NS + POSIX_MQUEUE（struct ipc_namespace 无条件定义，无条件成员）
-#     KSU（ReSukiSU 本身就以"兼容 GKI 预编译模块"为设计目标）
+#   本次 bisect 实测（每组单独开，逐组跑 ABI 预检）——按结论分成三类：
 #
-#   刷机前可用 scripts/check-abi-crc.py 拿 ROM 模块的 CRC 与自编内核
-#   Module.symvers 逐一比对，不一致就别刷（基线在 abi-baseline/abi-crcs.txt）。
+#   ◎ 实测【安全】的（0 个符号 CRC 变化）：
+#       PID_NS           —— gki_defconfig 本来就 =y，设备却是 n；实测无影响
+#       USER_NS          —— 5.10 这棵树里它不 gate 任何结构体成员
+#                           （user_struct.locked_vm 的条件是
+#                            PERF_EVENTS||BPF_SYSCALL||NET||IO_URING，早就是 y）
+#       ReSukiSU         —— 有无 KSU 的失配集合完全一致
+#       DEBUG_INFO=off   —— genksyms 只看类型，不看调试数据
+#
+#   ✗ 实测【致命】的（各让 295 / 725 个符号 CRC 变化）：
+#       CGROUP_DEVICE / CGROUP_PIDS  → 295 个
+#           include/linux/cgroup-defs.h 里
+#               struct css_set { ... subsys[CGROUP_SUBSYS_COUNT]; e_cset_node[CGROUP_SUBSYS_COUNT]; }
+#           CGROUP_SUBSYS_COUNT 由「已开启的 cgroup 子系统数」决定，
+#           设备上是 7（cpuset/cpu/cpuacct/io/memory/freezer/net_prio），
+#           一开这两个就变 9 → 定长数组变长 → css_set 布局变。
+#           ★ 没有任何 KABI 保留槽手段能补"数组长度"，所以只能不开。
+#             代价：Docker 会报 "Devices cgroup controller not available."
+#             （容器仍能跑，只是拿不到 devices 白名单与 pids 上限）
+#             要真正拿到这两个控制器，只能连 vendor 模块一起重编重刷
+#             （modules/qcom/... 那一大票，见 build.env 的 EXT_MODULES）。
+#       POSIX_MQUEUE                 → 725 个
+#           include/linux/sched/user.h 里
+#               #ifdef CONFIG_POSIX_MQUEUE
+#                   unsigned long mq_bytes;
+#               #endif
+#           user_struct 经 cred.user 被 task/file/socket 广泛引用，面极大。
+#           ★ 这个【已经救回来了】：scripts/patch-abi-safe.sh 把它挪进
+#             Android GKI 预留的 KABI 保留槽（ANDROID_KABI_USE(2, unsigned long mq_bytes)），
+#             genksyms 看到的文本与 ROM 逐字相同 → CRC 不变，实际布局也不变。
+#           ★ 为什么非用 POSIX_MQUEUE 不可：IPC_NS 的 Kconfig 是
+#               depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
+#             而 SYSVIPC 会给 struct task_struct 加 sysvsem/sysvshm（更致命），
+#             所以 IPC namespace 只能走 POSIX_MQUEUE 这条路。
+#       SYSVIPC / NF_TABLES          → 见文件开头的两个老雷（task_struct / struct net）
+#
+#   结论：最终交付配置 = 本碎片 - {CGROUP_DEVICE, CGROUP_PIDS}，
+#         即 ci/build-flags.txt 里的 FRAGMENT=docker。
+#         （scripts/filter-fragment.sh 的 docker 模式负责剔除这两个）
+#
+#   刷机前必过 scripts/check-abi-crc.py 的 ABI 预检：
+#   它会拿 ROM 模块的 CRC 与自己内核的 Module.symvers 逐一比对，不一致就报红、别刷。
+#   基线在 abi-baseline/abi-crcs.txt。
 #
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
-# 1. cgroup 基础  —— 重点是 CONFIG_CGROUP_DEVICE
+# 1. cgroup 基础
 #    【设备实测】CGROUP_DEVICE 与 CGROUP_PIDS 都是 "# ... is not set"
 #    （Kconfig 里 bool "Device controller" 没有 default y）。
 #    Docker 的 devices 白名单、以及模块日志里的
-#    "Devices cgroup controller not available." 都指向它。
-#    （设备 /proc/cgroups 里确实没有 devices / pids 行，已实测确认。）
+#    "Devices cgroup controller not available." 都指向它们。
+#
+#    ★★★ 但实测这两个开关【会破坏 ABI】（各让 295 个导出符号 CRC 变化）★★★
+#      它们会让 CGROUP_SUBSYS_COUNT 7→9，而 struct css_set / struct cgroup 里的
+#      subsys[CGROUP_SUBSYS_COUNT] / e_cset_node[CGROUP_SUBSYS_COUNT] 是定长数组，
+#      KABI 保留槽救不了数组长度 → 开了就卡米标。
+#      ⇒ 最终交付用 FRAGMENT=docker，由 scripts/filter-fragment.sh 把这两行剔除；
+#        保留在这里只是为了能复现 bisect B 组的 295 失配。
 # -----------------------------------------------------------------------------
 CONFIG_CGROUPS=y
 CONFIG_CGROUP_DEVICE=y
@@ -83,8 +123,11 @@ CONFIG_BLK_CGROUP=y
 #    ★ 这里用的是 POSIX_MQUEUE，不是 SYSVIPC ★
 #      SYSVIPC 会给 struct task_struct 加 sysvsem/sysvshm 两个成员，
 #      改变结构体布局 → ABI 崩（见文件开头"ABI 铁律"）。
-#      POSIX_MQUEUE 只影响 fs/mqueue.c 的内部结构，布局安全。
-#      Docker 需要的只是"有 IPC namespace 可以用"，POSIX_MQUEUE 足够满足依赖。
+#      POSIX_MQUEUE 本身也会给 struct user_struct 加 mq_bytes（725 个符号！），
+#      但那个坑【已由 scripts/patch-abi-safe.sh 修好】：mq_bytes 被挪进
+#      Android GKI 早就预留好的 KABI 保留槽（ANDROID_KABI_USE），
+#      genksyms 看到的文本与 ROM 逐字相同 → CRC 不变、布局也不变。
+#      ⇒ 所以这条路上必须【同时】应用该补丁，两者不可分开。
 # -----------------------------------------------------------------------------
 CONFIG_NAMESPACES=y
 CONFIG_NET_NS=y
@@ -95,6 +138,7 @@ CONFIG_USER_NS=y
 # IPC namespace 的前置条件（设备上原本也是 not set）
 CONFIG_POSIX_MQUEUE=y
 CONFIG_IPC_NS=y
+CONFIG_POSIX_MQUEUE_SYSCTL=y
 
 
 # -----------------------------------------------------------------------------

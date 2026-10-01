@@ -70,6 +70,17 @@ CONFIG_KSU
 "
 fi
 
+# docker 模式（最终交付配置）：刻意不开 CGROUP_DEVICE / CGROUP_PIDS。
+# 原因（bisect 实锤，各让 295 个导出符号 CRC 变化）：这两项会让
+# CGROUP_SUBSYS_COUNT 7→9，而 include/linux/cgroup-defs.h 里
+# struct css_set / struct cgroup 的 subsys[..] / e_cset_node[..] 是定长数组，
+# 没有任何 KABI 保留槽手段能补数组长度 → 只能放弃这两个控制器。
+# 代价：Docker 会报 "Devices cgroup controller not available."（功能仍可用）。
+if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
+  REQUIRED_Y=$(printf '%s\n' "$REQUIRED_Y" \
+               | grep -vE '^CONFIG_(CGROUP_DEVICE|CGROUP_PIDS)$')
+fi
+
 # ★ 绝对不能为 y 的项（ABI 铁律）★
 #   它们会改变【被导出符号可见的结构体布局】，让内核算出的符号 CRC 与
 #   ROM 里预编译 vendor 模块记录的期望值不一致 → 模块全部拒载 →
@@ -84,6 +95,13 @@ CONFIG_NF_TABLES
 CONFIG_NF_TABLES_BRIDGE
 CONFIG_SYSVIPC
 "
+# docker 交付配置里还多两项绝对不能为 y（会改 struct css_set 定长数组，见上）。
+if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
+  FORBIDDEN_Y="$FORBIDDEN_Y
+CONFIG_CGROUP_DEVICE
+CONFIG_CGROUP_PIDS
+"
+fi
 
 # 期望开启但允许缺失（不同内核版本符号名可能不同）
 OPTIONAL_Y="
