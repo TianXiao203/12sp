@@ -11,9 +11,8 @@
 #  2) 稳定性：build.sh 内部的 merge_defconfig_fragments 有两处快速 exit 1：
 #        "ERROR! Detected overridden config!"        （碎片覆盖了 base 里的非默认值）
 #        "ERROR! Treating config warnings as errors" （kconfig 有 warning）
-#  3) LTO：默认保持官方/设备的 FULL LTO（append 一个“最后的碎片”显式钉住），
-#     与设备上唯一"能启动"的那个内核一致。若 runner 内存不足导致 LTO 链接
-#     被 OOM 杀掉，可用第 3 个参数（或 LTO_MODE 环境变量）传 thin 兜底。
+#  3) LTO：默认 FULL（append 一个"最后的碎片"显式钉住），与设备一致。
+#     内存代价见下方 step 2 的说明（--threads=1 + 关 DEBUG_INFO 两招已解决）。
 #     注意：绝不能像以前那样用 `scripts/config -e THINLTO` —— 本内核树里
 #     【没有 CONFIG_THINLTO 这个符号】，只有 LTO_CLANG_THIN / LTO_CLANG_FULL，
 #     未知符号会让 scripts/config 退出非零，配合 set -e 直接让整步失败。
@@ -33,7 +32,10 @@ set -uo pipefail
 
 WS="${1:-}"
 OUT="${2:-}"
-# 第 3 个参数（或环境变量 LTO_MODE）: full | thin，默认 full（与设备上能启动的内核一致）
+# 第 3 个参数（或环境变量 LTO_MODE）: full | thin，默认 full（与设备/官方一致）。
+#   FULL 的内存代价已由两招解决（Run#10/11 实测可编）：
+#     a) link-vmlinux.sh 注入 --threads=1（编译步里做）
+#     b) FULL 模式下顺带关掉 DEBUG_INFO（见下方 else 分支）
 LTO_MODE="${3:-${LTO_MODE:-full}}"
 case "$LTO_MODE" in
   full|thin) ;;
@@ -144,13 +146,11 @@ else
 fi
 
 # ---- 3) 生成 thin-LTO 覆盖碎片（放在最后一个，覆盖 gki_defconfig 的 FULL）---
-step "2. 生成 thin-LTO 覆盖碎片"
-# LTO 模式：默认跟官方一致用 FULL。
-#   实测依据：设备上"能启动"的那个内核（第三方 ReSukiSU 包）是
-#   CONFIG_LTO_CLANG_FULL=y，而我们之前为了省内存改成了 THIN —— 刷进去会卡米标，
-#   所以现在默认回退到 FULL，与已知能启动的构建一模一样。
-#   如果 runner 内存不够导致 LTO 链接被 OOM 杀掉，可以用 --lto=thin 换回来
-#   （代价是与官方不一致，可能有问题）。
+step "2. 生成 LTO 覆盖碎片"
+# LTO 模式：默认 full（与设备上能启动的内核一致）。
+#   FULL LTO 在 16GB runner 上的内存代价已由两招解决（Run#10/11 实测）：
+#   a) link-vmlinux.sh 的 ld 调用注入 --threads=1（编译步做）
+#   b) FULL 模式顺带关 DEBUG_INFO（纯调试数据，不影响 CRC/类型）
 LTOFRAG_REL="arch/arm64/configs/vendor/zz-lto.config"
 if [ "$LTO_MODE" = "thin" ]; then
   LTO_BODY='CONFIG_LTO=y

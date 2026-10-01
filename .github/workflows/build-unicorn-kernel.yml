@@ -64,13 +64,13 @@ on:
           - gki
           - consolidate
       lto:
-        description: 'LTO 模式。默认 thin：官方指南证实 FULL LTO 编 GKI 需 >24GB 内存，16GB runner 必死（Run#8/9 两轮实证，--threads=1 也救不回）。FULL 留给以后有大内存机器时用'
+        description: 'LTO 模式，默认与设备/官方一致 FULL（Run#10/11 实测 --threads=1 + 关 DEBUG_INFO 后 16GB runner 可编）；thin 仅兜底'
         required: true
-        default: 'thin'
+        default: 'full'
         type: choice
         options:
-          - thin
           - full
+          - thin
       resukisu_branch:
         description: 'ReSukiSU 分支/标签/commit'
         required: true
@@ -124,6 +124,14 @@ on:
         options:
           - 'true'
           - 'false'
+      build_mode:
+        description: 'control=对照构建：直接用设备原版 .config（reference/device-config.txt），不集成 KSU、不加 Docker 碎片——用来裁决 ABI 预检的差异是我们造成还是构建环境造成'
+        required: true
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - control
 
 permissions:
   # 需要 write 才能把诊断/产物推到 ci-diag 与 ci-artifacts 分支
@@ -146,7 +154,8 @@ jobs:
       IN_CLANG: ${{ inputs.clang_version || 'clang-r563880c' }}
       IN_DEVICE: ${{ inputs.device || 'unicorn' }}
       IN_VARIANT: ${{ inputs.variant || 'gki' }}
-      IN_LTO: ${{ inputs.lto || 'thin' }}
+      IN_LTO: ${{ inputs.lto || 'full' }}
+      IN_MODE: ${{ inputs.build_mode || 'normal' }}
       IN_KSU_BRANCH: ${{ inputs.resukisu_branch || 'main' }}
       IN_KSU_HOOK: ${{ inputs.resukisu_hook || 'kprobes' }}
       IN_ENABLE_SUSFS: ${{ inputs.enable_susfs || 'false' }}
@@ -315,6 +324,7 @@ jobs:
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
 
       - name: 写入 Docker/cgroup + ReSukiSU 配置
+        if: ${{ (inputs.build_mode || 'control') != 'control' }}
         run: |
           set -e
           bash "$GITHUB_WORKSPACE/scripts/apply-configs.sh" \
@@ -322,6 +332,7 @@ jobs:
                "$GITHUB_WORKSPACE/configs/docker-cgroup.fragment"
 
       - name: 兜底：确保 ABI 危险项一定不在 defconfig 里
+        if: ${{ (inputs.build_mode || 'control') != 'control' }}
         run: |
           # 这三项会改变【被导出符号可见的结构体布局】，导致 ROM 里预编译的
           # vendor 模块集体拒载 → 卡在米标（详见 configs/docker-cgroup.fragment 开头）。
@@ -341,6 +352,7 @@ jobs:
           grep -nE '^(# )?CONFIG_(NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SYSVIPC|POSIX_MQUEUE|IPC_NS)=' "$DEF" || echo "    （都已不在文件中，即均为 n）"
 
       - name: 集成 ReSukiSU
+        if: ${{ (inputs.build_mode || 'control') != 'control' }}
         run: |
           set -e
           bash "$GITHUB_WORKSPACE/scripts/integrate-resukisu.sh" \
@@ -356,6 +368,7 @@ jobs:
           echo "::warning::已开 CONFIG_KSU_SUSFS=y；SUSFS 还需按内核版本打 susfs4ksu 内核侧补丁，否则编译会失败。"
 
       - name: 确认本树实际使用的 defconfig 碎片
+        if: ${{ (inputs.build_mode || 'control') != 'control' }}
         run: |
           set -e
           DEF="$WS/common/arch/arm64/configs/gki_defconfig"
@@ -374,6 +387,7 @@ jobs:
           grep -n kernelsu "$WS/common/drivers/Makefile" || true
 
       - name: 预生成合并 defconfig（gki_defconfig + 4 个碎片 + LTO 碎片）
+        if: ${{ (inputs.build_mode || 'control') != 'control' }}
         run: |
           # 脚本自己写日志（PRECONFIG_LOG），失败时会用 ::error:: 发出注解
           # —— 因为 Actions 的 job log 接口需要仓库 admin 权限（匿名 403），
@@ -387,6 +401,54 @@ jobs:
             exit "$rc"
           fi
           echo "[OK] .config 已生成：$(ls -l "$WS/out/common/.config")"
+
+      - name: 对照模式：直接用设备原版 .config（不集成 KSU、不加任何碎片）
+        if: ${{ (inputs.build_mode || 'control') == 'control' }}
+        run: |
+          # 目的（Run#10/11 之后的关键裁决实验）：
+          #   Run#10/11 的 ABI 预检报 725/1241 符号 CRC 与 ROM vendor 模块不一致，
+          #   但全量 diff 证明设备 .config 与我们只差 26 项（且不含任何能改结构体
+          #   布局的项），同树同编译器 —— 差异来源存疑。
+          #   control 模式把变量全部去掉：设备原版 .config、不集成 ReSukiSU、
+          #   不加 Docker 碎片、不改 drivers/*，只保留 .scmversion 和
+          #   link-vmlinux.sh 的 --threads=1（不改产物语义）。
+          #   若 control 的 CRC 仍不一致 -> 差异来自构建环境（plain make vs
+          #   官方 build.sh），下一步去对官方调用；若一致 -> 差异来自我们的
+          #   配置/KSU，逐项 bisect。
+          # 唯一允许的偏离：关闭 DEBUG_INFO 家族 —— FULL LTO 的调试信息生成
+          #   会把 16GB runner OOM 整杀（Run#8/9 实证）；纯调试数据，
+          #   不参与类型/genksyms CRC/vermagic。
+          set -eo pipefail
+          cd "$WS/common"
+
+          CLANG_BIN="$(ls -d "$WS"/prebuilts-master/clang/host/linux-x86/*/bin 2>/dev/null | head -1 || true)"
+          [ -n "$CLANG_BIN" ] && export PATH="$CLANG_BIN:$PATH"
+
+          OUT="$WS/out/common"
+          mkdir -p "$OUT"
+          # O= 构建要求源码树干净（顶层 Makefile outputmakefile 检查）。
+          # control 模式跳过了 preconfig（它负责清理），这里自己做一遍。
+          rm -f .config
+          rm -rf include/config include/generated arch/arm64/include/generated 2>/dev/null || true
+          cp -f "$GITHUB_WORKSPACE/reference/device-config.txt" "$OUT/.config"
+          echo "[+] 已复制设备原版 .config（$(wc -l < "$OUT/.config") 行）"
+
+          # 关掉 DEBUG_INFO 家族（唯一允许的偏离）
+          sed -i -E '/^(# )?CONFIG_(DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_DWARF[0-9]*|DEBUG_INFO_COMPRESSED|DEBUG_INFO_REDUCED|DEBUG_INFO_SPLIT|GDB_SCRIPTS|DEBUG_EFI)(=.*)?$/d' "$OUT/.config"
+          printf '# CONFIG_DEBUG_INFO is not set\n' >> "$OUT/.config"
+
+          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+               READELF=llvm-readelf STRIP=llvm-strip HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld \
+               olddefconfig 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+
+          echo "== 关键状态（应与设备一致，DEBUG_INFO 除外）=="
+          grep -E '^CONFIG_(LTO_CLANG|LTO_CLANG_FULL|CFI_CLANG|MODVERSIONS|LOCALVERSION|PAGE_EXTENSION)=' "$OUT/.config" | sed 's/^/    /'
+          echo "== 与设备原版的差异（应只剩 DEBUG_INFO 家族）=="
+          diff <(grep -E '^(# )?CONFIG_' "$GITHUB_WORKSPACE/reference/device-config.txt" | sed -E 's/^(# )?CONFIG_(DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_DWARF[0-9]*|DEBUG_INFO_COMPRESSED|DEBUG_INFO_REDUCED|DEBUG_INFO_SPLIT|GDB_SCRIPTS|DEBUG_EFI)(=.*)?$/X-dbginfo-X/; /^X-dbginfo-X$/d' | sort) \
+               <(grep -E '^(# )?CONFIG_' "$OUT/.config" | sed -E 's/^(# )?CONFIG_(DEBUG_INFO|DEBUG_INFO_BTF|DEBUG_INFO_DWARF[0-9]*|DEBUG_INFO_COMPRESSED|DEBUG_INFO_REDUCED|DEBUG_INFO_SPLIT|GDB_SCRIPTS|DEBUG_EFI)(=.*)?$/X-dbginfo-X/; /^X-dbginfo-X$/d' | sort) \
+               | head -40 | sed 's/^/    /' || true
+          echo "[OK] control 模式 .config 就绪"
 
       - name: 编译内核（直接 make Image）
         run: |
@@ -438,7 +500,7 @@ jobs:
           # 限制成单线程后峰值内存从 ~14GB 级降到 ~5GB 级（代价是链接更慢，可接受）。
           # 注意：只能 FULL 模式注入 —— lld 规定 --thinlto-jobs 未指定时默认取 --threads，
           # thin 构建注入会把 ThinLTO 也限成单线程、白白变慢。
-          if [ "$IN_LTO" = "full" ]; then
+          if grep -q '^CONFIG_LTO_CLANG_FULL=y' "$KCONFIG_CONFIG"; then
             LVS="scripts/link-vmlinux.sh"
             if ! grep -q -- '--threads=1' "$LVS"; then
               sed -i 's|-r -o ${1} ${lds} ${objects}|--threads=1 -r -o ${1} ${lds} ${objects}|' "$LVS"
@@ -639,7 +701,7 @@ jobs:
             build.log
 
       - name: 成功时把 AK3 包推到 ci-artifacts 分支（可匿名 clone，省掉手工下载）
-        if: success() && (inputs.publish_artifacts || 'true') == 'true'
+        if: success() && (inputs.publish_artifacts || 'true') == 'true' && (inputs.build_mode || 'control') != 'control'
         continue-on-error: true
         run: |
           # 为什么要这一步：

@@ -149,3 +149,13 @@ CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
 # -----------------------------------------------------------------------------
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
+
+
+# -----------------------------------------------------------------------------
+# 7. 补齐与设备真实 .config 的差异（对齐官方构建）
+#    【设备实测】reference/device-config.txt:7485 是 CONFIG_PAGE_EXTENSION=y，
+#    但 gki_defconfig 里【没有这一行】（Kconfig 无 default y）→ 我们的合并
+#    结果是 n（Run#7 与设备 diff 的 20 项差异之一）。补回来，减少与
+#    "能启动的官方内核"的分歧面。
+# -----------------------------------------------------------------------------
+CONFIG_PAGE_EXTENSION=y
