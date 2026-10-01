@@ -1,0 +1,53 @@
+run_id=36858532215  attempt=1
+sha=9e3934fe9f25fcf743ea6aaadce1c9ad09cdd537
+ws=/mnt/wbkernel/kp
+
+== df -h ==
+Filesystem       Size  Used Avail Use% Mounted on
+/dev/root        146G   68G   78G  47% /
+tmpfs            7.9G  172K  7.9G   1% /dev/shm
+tmpfs            3.2G  1.0M  3.2G   1% /run
+tmpfs            5.0M     0  5.0M   0% /run/lock
+/dev/nvme0n1p15  105M  6.1M   99M   6% /boot/efi
+tmpfs            1.6G   12K  1.6G   1% /run/user/1001
+
+== free -h ==
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       744Mi       6.1Gi        49Mi       8.7Gi        14Gi
+Swap:          3.0Gi       0.0Ki       3.0Gi
+
+== kernel.release ==
+5.10.260-gki-gef362912d37b
+
+== .scmversion ==
+-gef362912d37b
+== upload/ ==
+total 64884
+drwxr-xr-x  2 runner runner     4096 Oct  1 12:11 .
+drwxr-xr-x 17 runner runner     4096 Oct  1 12:11 ..
+-rwxr-xr-x  1 runner runner 42139732 Oct  1 12:11 Image
+-rw-r--r--  1 runner runner 22198660 Oct  1 12:11 anykernel3-unicorn.zip
+-rw-r--r--  1 runner runner   173610 Oct  1 12:11 build.log
+-rw-r--r--  1 runner runner   817874 Oct  1 12:11 kernel.Module.symvers
+-rw-r--r--  1 runner runner   211059 Oct  1 12:11 kernel.config.txt
+-rw-r--r--  1 runner runner   878163 Oct  1 12:11 kernel.vmlinux.symvers
+
+== AnyKernel3 工作目录 ==
+total 41220
+drwxr-xr-x  7 runner runner     4096 Oct  1 12:11 .
+drwxr-xr-x 17 runner runner     4096 Oct  1 12:11 ..
+drwxr-xr-x  7 runner runner     4096 Oct  1 12:11 .git
+drwxr-xr-x  2 runner runner     4096 Oct  1 12:11 .github
+-rwxr-xr-x  1 runner runner 42139732 Oct  1 12:11 Image
+-rw-r--r--  1 runner runner    11630 Oct  1 12:11 LICENSE
+drwxr-xr-x  3 runner runner     4096 Oct  1 12:11 META-INF
+-rw-r--r--  1 runner runner    16507 Oct  1 12:11 README.md
+-rw-r--r--  1 runner runner     2675 Oct  1 12:11 anykernel.sh
+drwxr-xr-x  2 runner runner     4096 Oct  1 12:11 patch
+drwxr-xr-x  2 runner runner     4096 Oct  1 12:11 tools
+
+== 仓库自带文件 ==
+total 12
+drwxr-xr-x  2 runner runner 4096 Oct  1 11:56 .
+drwxr-xr-x 17 runner runner 4096 Oct  1 12:11 ..
+-rw-r--r--  1 runner runner 2675 Oct  1 11:56 anykernel.sh
