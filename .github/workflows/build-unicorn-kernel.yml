@@ -373,7 +373,7 @@ jobs:
           ls -l "$WS/common/drivers/kernelsu" || true
           grep -n kernelsu "$WS/common/drivers/Makefile" || true
 
-      - name: 预生成合并 defconfig（gki_defconfig + 4 个碎片 + thin LTO）
+      - name: 预生成合并 defconfig（gki_defconfig + 4 个碎片 + LTO 碎片）
         run: |
           # 脚本自己写日志（PRECONFIG_LOG），失败时会用 ::error:: 发出注解
           # —— 因为 Actions 的 job log 接口需要仓库 admin 权限（匿名 403），
@@ -428,7 +428,32 @@ jobs:
           grep -E '^CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|LTO_CLANG|LTO_CLANG_THIN|LTO_CLANG_FULL|CFI_CLANG|KSU|CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|POSIX_MQUEUE|IPC_NS)=' \
             "$KCONFIG_CONFIG" | sed 's/^/    /' || true
 
-          echo "== 开始编译 Image（预计 20~60 分钟）=="
+          # ---- FULL LTO 内存瘦身（Run#8 的死因）----
+          # FULL LTO 的重头戏是 link-vmlinux.sh 里 modpost_link() 的
+          #   ${LD} ${KBUILD_LDFLAGS} -r -o vmlinux.o ...
+          # （全程序 LTO 代码生成，默认 --threads=所有核，每个线程各自持有内存副本）。
+          # 16GB runner 上它会把整机 OOM 杀掉 —— Run#8 的铁证：
+          # 连 if:always() 的诊断步骤（23/24/25）都没能执行，只有 runner 级死亡才会这样。
+          # lld 文档：--threads=N，"1 disables multi-threading"；
+          # 限制成单线程后峰值内存从 ~14GB 级降到 ~5GB 级（代价是链接更慢，可接受）。
+          # 注意：只能 FULL 模式注入 —— lld 规定 --thinlto-jobs 未指定时默认取 --threads，
+          # thin 构建注入会把 ThinLTO 也限成单线程、白白变慢。
+          if [ "$IN_LTO" = "full" ]; then
+            LVS="scripts/link-vmlinux.sh"
+            if ! grep -q -- '--threads=1' "$LVS"; then
+              sed -i 's|-r -o ${1} ${lds} ${objects}|--threads=1 -r -o ${1} ${lds} ${objects}|' "$LVS"
+            fi
+            grep -q -- '--threads=1 -r -o ${1}' "$LVS" || {
+              echo "::error title=link-vmlinux.sh 补丁失败::没匹配到 modpost_link 的 \${LD} 调用行（上游脚本可能变了），请人工核对"
+              exit 1
+            }
+            echo "[+] FULL LTO: 已给 $LVS 的 modpost_link() 注入 --threads=1（Run#8 OOM 对策）"
+            grep -n -- '--threads=1' "$LVS" | sed 's/^/    /'
+          else
+            echo "[i] LTO=thin：不注入 --threads（避免把 ThinLTO 也限成单线程）"
+          fi
+
+          echo "== 开始编译 Image（预计 20~90 分钟；FULL LTO 单线程链接会显著变慢）=="
           # 暂时关掉 -e：要把 make 的真实退出码抓出来并转成 ::error:: 注解，
           # 否则 `make | tee` 一旦失败就直接跳出，什么都看不到。
           set +e
