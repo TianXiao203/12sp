@@ -46,8 +46,16 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
 - **`/repos/{o}/{r}/check-runs/{id}/annotations` 匿名可读（200）**
   → 失败路径必须主动 `echo "::error::<行>"` 才能远程取到报错
 - 失败时 workflow 会把 `build.log` 推到 **`ci-diag` 分支**（可匿名 clone）
-- 本机可 `git push`（SSH 已配）；`raw.githubusercontent.com` 不稳，优先用
-  api.github.com contents（base64），注意 60 次/小时匿名限流
+- 成功时把 AK3 包推到 **`ci-artifacts` 分支**（`publish_artifacts` 开关）；
+  已有 run 的产物可用 `.github/workflows/publish-artifact.yml` 跨 run 转分支
+  （`actions/download-artifact@v4` 的 `run-id` 参数 + `permissions: actions: read`），
+  **不必重编**。nightly.link 对未注册仓库 404，不可用。
+- **拿不到产物时的替代路径**：直接让用户在 run 页面点下载（他习惯下到手机
+  `/sdcard/Download/微信输入法/...` 或 PC 的 Downloads）
+- 本机可 `git push`（SSH 已配，但沙箱代理会间歇性拦截 SSH；
+  被拦时用 HTTPS + `-c http.schannelCheckRevoke=false`，或让用户自己推）
+- `raw.githubusercontent.com` 不稳，优先用 api.github.com contents（base64），
+  注意 60 次/小时匿名限流
 
 ## 两个必须遵守的硬规则（都踩过坑）
 1. **版本串必须精确等于 `5.10.260-gki-gef362912d37b`**，否则 ROM 现成的
