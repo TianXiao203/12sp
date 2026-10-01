@@ -105,9 +105,17 @@ on:
         options:
           - 'true'
           - 'false'
+      publish_artifacts:
+        description: '成功时把 AK3 包推到 ci-artifacts 分支（artifact 下载要 auth；推分支后可用 git clone 匿名取，免去手工下载）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
-  # 需要 write 才能把诊断推到 ci-diag 分支（仅失败时，可用 push_diag_branch=false 关掉）
+  # 需要 write 才能把诊断/产物推到 ci-diag 与 ci-artifacts 分支
   contents: write
 
 jobs:
@@ -542,6 +550,52 @@ jobs:
           path: |
             upload/**
             build.log
+
+      - name: 成功时把 AK3 包推到 ci-artifacts 分支（可匿名 clone，省掉手工下载）
+        if: success() && inputs.publish_artifacts == 'true'
+        continue-on-error: true
+        run: |
+          # 为什么要这一步：
+          #   Artifacts 的下载接口需要 auth（匿名 401），所以产物只能靠人在网页上点下载。
+          #   而 git 分支可以匿名 clone —— 把 AK3 zip 推到一个独立分支 ci-artifacts，
+          #   之后就能用一条 git clone 直接拿到包（本机 adb 刷机链路也因此能全自动）。
+          #   该分支每次都用 --orphan 重建，历史不会无限膨胀。
+          set -uo pipefail
+          cd "$GITHUB_WORKSPACE"
+          ZIP="upload/anykernel3-unicorn.zip"
+          if [ ! -f "$ZIP" ]; then
+            echo "::warning title=无可发布产物::$ZIP 不存在，跳过"
+            exit 0
+          fi
+          git config user.name  "kernel-ci"
+          git config user.email "kernel-ci@localhost"
+          mkdir -p art
+          cp -f "$ZIP" art/anykernel3-unicorn.zip
+          cp -f upload/kernel.config.txt art/ 2>/dev/null || true
+          cp -f build.log art/build.log 2>/dev/null || true
+          {
+            echo "run_id=${{ github.run_id }}"
+            echo "sha=${{ github.sha }}"
+            echo "branch=${{ inputs.lineage_branch }}"
+            echo "kernel_commit=${{ inputs.kernel_commit }}"
+            echo "clang_version=${{ inputs.clang_version }}"
+            echo "kernel.release=$(cat "$WS/out/common/include/config/kernel.release" 2>/dev/null)"
+            echo "scmversion=$(cat "$WS/common/.scmversion" 2>/dev/null)"
+            echo "zip_bytes=$(stat -c %s art/anykernel3-unicorn.zip 2>/dev/null)"
+            echo "zip_sha256=$(sha256sum art/anykernel3-unicorn.zip 2>/dev/null | cut -d' ' -f1)"
+          } > art/INFO.txt 2>&1
+          cat art/INFO.txt
+          ls -l art/
+          # 用 orphan 分支避免带上一堆源码历史
+          git checkout -q --orphan ci-artifacts
+          git rm -rq --cached . 2>/dev/null || true
+          git add -f art
+          git -c user.name=kernel-ci -c user.email=kernel-ci@localhost \
+              commit -m "ci-artifacts: run ${{ github.run_id }} (${{ github.sha }})" \
+              || echo "[i] 没有变更可提交"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              ci-artifacts 2>&1 | tail -5
+          echo "::notice title=产物已发布:: 分支 ci-artifacts/art/anykernel3-unicorn.zip（可匿名 clone）"
 
       - name: 汇总诊断信息（无论成功失败都跑）
         if: always()
