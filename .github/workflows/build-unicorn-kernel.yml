@@ -64,13 +64,13 @@ on:
           - gki
           - consolidate
       lto:
-        description: 'LTO 模式。必须与设备上能启动的内核一致（实测 FULL）；thin 只在 runner 内存不足、LTO 链接被 OOM 杀掉时兜底'
+        description: 'LTO 模式。默认 thin：官方指南证实 FULL LTO 编 GKI 需 >24GB 内存，16GB runner 必死（Run#8/9 两轮实证，--threads=1 也救不回）。FULL 留给以后有大内存机器时用'
         required: true
-        default: 'full'
+        default: 'thin'
         type: choice
         options:
-          - full
           - thin
+          - full
       resukisu_branch:
         description: 'ReSukiSU 分支/标签/commit'
         required: true
@@ -146,7 +146,7 @@ jobs:
       IN_CLANG: ${{ inputs.clang_version || 'clang-r563880c' }}
       IN_DEVICE: ${{ inputs.device || 'unicorn' }}
       IN_VARIANT: ${{ inputs.variant || 'gki' }}
-      IN_LTO: ${{ inputs.lto || 'full' }}
+      IN_LTO: ${{ inputs.lto || 'thin' }}
       IN_KSU_BRANCH: ${{ inputs.resukisu_branch || 'main' }}
       IN_KSU_HOOK: ${{ inputs.resukisu_hook || 'kprobes' }}
       IN_ENABLE_SUSFS: ${{ inputs.enable_susfs || 'false' }}
@@ -600,6 +600,17 @@ jobs:
           fi
           cp -f "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/upload/" 2>/dev/null || true
 
+          # modpost 在 "MODPOST vmlinux.symvers" 一步产出的官方 CRC 文件：
+          # 它读的是 vmlinux.o 符号表里 __crc_* 绝对符号的 st_value —— 与内核
+          # 运行时校验模块用的值同源。作为 ABI 预检的首选数据源。
+          VSYM="$(find "$WS/out" -maxdepth 4 -type f -name 'vmlinux.symvers' -print -quit || true)"
+          if [ -n "$VSYM" ] && [ -s "$VSYM" ]; then
+            cp -f "$VSYM" "$GITHUB_WORKSPACE/upload/kernel.vmlinux.symvers"
+            echo "[+] modpost 的 vmlinux.symvers 已收集 ($(wc -l < "$VSYM") 行)"
+          else
+            echo "[i] 没找到 modpost 的 vmlinux.symvers（ABI 预检将用自研解析器）"
+          fi
+
           echo "== 调用 pack-anykernel3.sh =="
           bash "$GITHUB_WORKSPACE/scripts/pack-anykernel3.sh" \
                "$GITHUB_WORKSPACE/ak3dist" "$GITHUB_WORKSPACE/AnyKernel3" \
@@ -688,7 +699,14 @@ jobs:
           # .ko 里抽出来的（scripts/check-abi-crc.py baseline）。
           set -uo pipefail
           BASE="$GITHUB_WORKSPACE/abi-baseline/abi-crcs.txt"
-          SYMV="$GITHUB_WORKSPACE/upload/kernel.Module.symvers"
+          # 数据源优先级：
+          #   1) kernel.vmlinux.symvers —— modpost 官方产出（读 __crc_* 符号值，零假设）
+          #   2) kernel.Module.symvers  —— 自研 dump-vmlinux（已升级为符号表法，
+          #      旧索引配对法仅作对照）
+          SYMV="$GITHUB_WORKSPACE/upload/kernel.vmlinux.symvers"
+          if [ ! -f "$SYMV" ]; then
+            SYMV="$GITHUB_WORKSPACE/upload/kernel.Module.symvers"
+          fi
           if [ ! -f "$BASE" ]; then
             echo "::warning title=无 ABI 基线::找不到 $BASE，跳过 ABI 预检"
             exit 0

@@ -241,6 +241,15 @@ def cmd_dump_vmlinux(args):
         f.seek(kc_off)
         kc_raw = f.read(kc_size)
 
+        # 取证信息：两张表的条目数。__ksymtab 和 __kcrctab 是"同序平行数组"，
+        # 前提是每个导出符号在两张表里都各有一条。条目数一旦不相等，
+        # 按索引配对从缺口处开始整体错位 —— Run#10 的 58% CRC 不一致
+        # 强烈怀疑就是这个（正在用符号表法交叉验证）。
+        print('[i] %s=%d 条目 vs %s=%d 条目 %s'
+              % (ks_name, ks_size // 12, kc_name, kc_size // 4,
+                 '（一致）' if ks_size // 12 == kc_size // 4
+                 else '（!!! 不一致 -> 索引配对从此错位）'))
+
         best = None
         for lname, entsz, is_prel in layouts:
             n = ks_size // entsz
@@ -273,6 +282,52 @@ def cmd_dump_vmlinux(args):
     if not out:
         print('[FAIL] 没能从 vmlinux 解析出任何符号 CRC', file=sys.stderr)
         return 2
+
+    # ---- 权威数据源：符号表里的 __crc_<sym> 绝对符号（与 modpost 同源）----
+    # `___kcrctab+<sym>` 节里放的是 `.long __crc_<sym>`；链接脚本（.tmp_symversions.lds）
+    # 把 __crc_<sym> 定义为绝对符号、值就是 CRC。modpost 读的就是这些符号的 st_value。
+    # 直接从 vmlinux 符号表读 __crc_* 同样可以 —— 完全不依赖"两表同序平行"的假设。
+    # 上面的索引配对法一旦错位就会得到错误 CRC（Run#10 疑似翻车点），这里交叉验证。
+    crc_symtab = {}
+    for i in range(e_shnum):
+        n, t, fl, a, o, sz = sh(i)
+        if t != 2:  # SHT_SYMTAB
+            continue
+        # 符号表头：name(4) type(4) flags(8) addr(8) offset(8) size(8) link(4) info(4) align(8) entsize(8)
+        link = struct.unpack_from('<I', raw, i * e_shentsize + 40)[0]
+        _n2, _t2, _f2, _a2, stro, strsz = sh(link)
+        f.seek(stro)
+        strt = f.read(strsz)
+        f.seek(o)
+        symtab = f.read(sz)
+        entsize = struct.unpack_from('<Q', raw, i * e_shentsize + 56)[0] or 24
+        cnt = len(symtab) // entsize
+        for j in range(cnt):
+            off = j * entsize
+            st_name = struct.unpack_from('<I', symtab, off)[0]
+            if st_name >= len(strt):
+                continue
+            e = strt.find(b'\0', st_name)
+            nm = strt[st_name:e].decode('utf-8', 'replace')
+            if not nm.startswith('__crc_'):
+                continue
+            st_value = struct.unpack_from('<Q', symtab, off + 8)[0]
+            crc_symtab[nm[6:]] = st_value & 0xFFFFFFFF
+        print('[i] 符号表法：读到 %d 个 __crc_* 符号' % len(crc_symtab))
+        break
+
+    if crc_symtab:
+        # 两法交叉验证：把配对法明显错位的证据打出来
+        both = set(out) & set(crc_symtab)
+        diff = [s for s in both if out[s] != crc_symtab[s]]
+        print('[i] 交叉验证：两法共同符号 %d 个，CRC 不同 %d 个%s'
+              % (len(both), len(diff),
+                 ' —— 配对法存在错位，已改用符号表法！' if diff else '（两法一致）'))
+        for s in sorted(diff)[:10]:
+            print('[i]   配对法错位样例: %-40s 配对=0x%08x 符号表=0x%08x'
+                  % (s, out[s], crc_symtab[s]))
+        out = dict(crc_symtab)
+
     with open(args.output, 'w', encoding='utf-8') as fo:
         for s in sorted(out):
             fo.write('0x%08x\t%s\tvmlinux\tEXPORT_SYMBOL\n' % (out[s], s))
