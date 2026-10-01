@@ -57,22 +57,52 @@ LTO 从官方 FULL 改成 **THIN**（16GB/4 核 runner 上 Full LTO 会 OOM）�
 - `raw.githubusercontent.com` 不稳，优先用 api.github.com contents（base64），
   注意 60 次/小时匿名限流
 
-## 两个必须遵守的硬规则（都踩过坑）
-1. **版本串必须精确等于 `5.10.260-gki-gef362912d37b`**，否则 ROM 现成的
-   vendor 模块全部加载失败（能开机但 Wi-Fi/蓝牙/音频废）。
+## 必须遵守的硬规则（全都踩过坑，按重要性排序）
+1. **★ ABI 铁律：绝不能开会改变结构体布局的配置项**（比版本串更致命、更难查）。
+   内核与 ROM 里 395 个预编译 `/vendor/lib/modules/*.ko` 是**分离编译**的：
+   模块把所需符号的 CRC 写在 `__versions` 段，内核加载时比对，不一致就拒载。
+   CRC 由 `genksyms` 从【类型定义】算出 → 改了结构体布局 = 所有相关导出符号
+   CRC 全变 = 模块集体拒载 = **屏幕永远停在米标**（hang 不是 panic，
+   所以无日志、pstore 空、dropbox 无 `SYSTEM_LAST_KMSG`）。
+   已确认的杀手（都别开）：
+     - `CONFIG_NF_TABLES=y` → `include/net/net_namespace.h:145` 给 `struct net`
+       加 `netns_nftables nft;`
+     - `CONFIG_SYSVIPC=y` → `include/linux/sched.h:973` 给 `struct task_struct`
+       加 `sysv_sem sysvsem; sysv_shm sysvshm;`
+       （所以 `IPC_NS` 的前置依赖要用 `POSIX_MQUEUE`，不是 `SYSVIPC`）
+   已验证安全（本项目在用）：`CGROUP_DEVICE`/`CGROUP_PIDS`/`PID_NS`/`USER_NS`/
+   `IPC_NS`+`POSIX_MQUEUE`/`KSU`。
+   防护三层：fragment 不含危险项 + workflow 兜底 sed 删除 +
+   **`ABI 预检`**（`scripts/check-abi-crc.py` 比对 `Module.symvers` 与
+   `abi-baseline/abi-crcs.txt` 的 1613 个符号 CRC，不一致 CI 报红、别刷）。
+   联网可行的查法：把候选配置名丢进内核源码头文件里 grep `#if*CONFIG_X`，
+   看是否落在某个 struct 定义内。
+2. **版本串必须精确等于 `5.10.260-gki-gef362912d37b`**，否则 ROM 现成的
+   vendor 模块加载失败（vermagic 不一致）。
    `scripts/setlocalversion` 对脏工作树会追加 `-dirty`，而我们必然要改
    `gki_defconfig` / `drivers/Makefile` / `drivers/Kconfig`。
    对策：在**刚 checkout、树还干净时**写 `$WS/common/.scmversion` =
    `-g$(git rev-parse HEAD | cut -c1-12)`；setlocalversion 会优先读它并直接 return。
-2. **clang 版本必须与设备内核一致**（`clang-r563880c`，clang 21.0.0 / build 14054515）。
-   因为 `CONFIG_CFI_CLANG=y` 的**类型哈希由编译器算出来**，而 ROM 里的
-   vendor_dlkm 模块是官方 clang 21 编的。内核换了 clang 版本 → 哈希对不上 →
-   刷进去**卡在开机 logo**，屏幕无报错、pstore 也为空（是 hang 不是 panic）。
-   实测：clang 12 编的刷进去卡 logo；用 clang 21 编的（用户当前内核）能启动。
-3. **Windows 上写 `.gitignore` 必须逐个 `git check-ignore -v` 验证**：
+3. **clang 版本必须与设备内核一致**（`clang-r563880c`，clang 21.0.0 / build 14054515）。
+   因为 `CONFIG_CFI_CLANG=y` 的**类型哈希由编译器算出来**。
+   来源：`bluegreensea/android_prebuilts_clang_kernel_linux-x86_clang-r563880c`
+   （LineageOS 侧**没有**这个仓库；且名字带 `c` 后缀，写成 r563880 会 404）。
+4. **Windows 上写 `.gitignore` 必须逐个 `git check-ignore -v` 验证**：
    本机 `core.ignorecase=true`，gitignore 匹配不区分大小写。
    曾因写 `AnyKernel3/` 把仓库里的 `anykernel3/` 一起忽略，导致该文件从未入库、
    CI 上 `cp` 找不到源文件而静默秒退。**绝不能出现大小写只差的名字。**
+5. **AnyKernel3 的 `anykernel.sh` 变量必须大写**（`BLOCK=` / `IS_SLOT_DEVICE=` /
+   `RAMDISK_COMPRESSION=` / `PATCH_VBMETA_FLAG=`）：现行 ak3-core.sh 删掉了
+   小写兼容层，写小写会报 `Unable to determine  partition`（两个空格=变量为空）。
+   脚本文件名必须是规范小写 `anykernel.sh`（backend 里 `ash anykernel.sh` 写死）。
+
+## 排查"卡米标"的判据（本次总结）
+- pstore `/sys/fs/pstore/` 空 + dropbox 无 `SYSTEM_LAST_KMSG` + 无 tombstones
+  ⇒ **是 hang 不是 panic**，别指望日志；往"启动早期就死"的方向查
+  （ABI 不兼容 / 模块拒载 / DTB 不匹配）。
+- 判断 ABI 不兼容的快速手段：`scripts/check-abi-crc.py check`。
+- 米标由 bootloader 画；内核接手屏幕要靠 vendor 模块的显示驱动，
+  所以"模块全拒载"的现象就是永远停在米标。
 
 ## 构建工作区
 源码/JDK 都放 `/mnt/wbkernel/kp`（runner 上 `/mnt` 约 70~86GB 可用，`/` 只有约 14GB），
