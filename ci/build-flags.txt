@@ -9,7 +9,7 @@
 #   FRAGMENT=all|ns|cgroup|none
 #   DEBUG_INFO=on|off 默认 off（16GB runner 的 FULL LTO OOM 对策）
 #
-# --- bisect D：FRAGMENT=none（唯一差异=PID_NS）---
-KSU=off
+# --- bisect E：FRAGMENT=none + KSU=on —— 隔离 ReSukiSU 集成本身 ---
+KSU=on
 FRAGMENT=none
 DEBUG_INFO=on
