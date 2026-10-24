@@ -152,9 +152,9 @@ echo "[assemble] clang 版本: $CLANG_VER"
 #   而不是 kCFI 的 __kcfi_typeid），跨模块调用的 type id 由编译器分配，
 #   clang 版本不同 id 分配就不同。内核与 vendor 模块对不上 → 早期间接调用
 #   CFI 失败 → 控制台还没起来，表现为**卡在开机 logo**（不是 panic 提示）。
-#   实测（2026-10-24 重新核对）：设备 23.2-20261002 nightly 的内核是
-#     CONFIG_CC_VERSION_TEXT="Android (13290119, ...) based on r547379) clang version 20.0.0"
-#   ⇒ 本版必须用 clang-r547379；之前 5.10.260 时代的 clang 21/r563880c 已不适用。
+#   实测（2026-10-25 重新核对）：设备已升 LineageOS 24.0（Android 17），
+#     CONFIG_CC_VERSION_TEXT="Android (15071444, ...) based on r596125) clang version 22.0.2"
+#   ⇒ 本版必须用 clang-r596125；23.2 时代的 r547379 已不适用。
 #
 # 获取顺序（每个都校验 bin/clang 是否存在）：
 #   1. LineageOS 的 kernel-clang 仓库（老版本如 r416183b 在这里）
@@ -163,6 +163,17 @@ echo "[assemble] clang 版本: $CLANG_VER"
 #      含 r547379 —— 目前 GitHub 上唯一能直接取到 clang 20 的地方）
 #   4. AOSP googlesource 的目录归档（GitHub runner 上通常可达，~1GB）
 #   5. codeload 的 tar.gz（镜像仓库的归档，不依赖 git 对象历史）
+#
+# ★★ AOSP 那个归档有两个必须知道的坑（r596125 在 GitHub 上没有镜像，
+#    只能走这条路，所以下面写死了正确的分支名）：
+#   坑 1：分支名不是 main。2023 年 master-kernel-build-YYYY 改名为
+#         main-kernel-build-YYYY，2025 年又改成 main-kernel-YYYY。新版 clang
+#         （r596125）只在 main-kernel 上；用 main 取到的是别的东西。
+#   坑 2：AOSP 每个 kernel 分支的树里【列出了所有 clang 版本目录】，但只有
+#         建分支时真正用到的那个里面有工具链，其余是 .keep 占位符。对占位符
+#         下载归档会返回 HTTP 200 + 一个约 165 字节的合法空 tar.gz，
+#         解压后 clang/ 是空的 —— 表现就是后面莫名其妙的 "clang: not found"。
+#         所以下面解压后必须校验 bin/clang 存在且能执行。
 try_clang_repo() {
   local url="$1" br="${2:-}"
   log "尝试 clang 源: $url ${br:+(-b $br)}"
@@ -203,11 +214,50 @@ fi
 
 if [ ! -x "$CLANG_DIR/bin/clang" ]; then
   warn "上面的 git 源都不可用，改从 android.googlesource.com 取目录归档"
-  mkdir -p "$CLANG_DIR"
-  URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/$CLANG_VER.tar.gz"
-  if curl -fL --retry 3 -m 1800 "$URL" | tar xz -C "$CLANG_DIR" 2>/dev/null && [ -x "$CLANG_DIR/bin/clang" ]; then
-    echo "[assemble][OK] tar 方式获取 clang 成功"
-  fi
+
+  # AOSP 的 branch/version 必须成对，且分支名经历了两次改名：
+  #   master-kernel-build-YYYY (2022 及以前) → main-kernel-build-YYYY (2023/24)
+  #   → main-kernel-YYYY (2025 起) ；最新的 r596125 在 main-kernel 上。
+  # 只列已验证存在的组合；未知版本先按 main-kernel-2025 试一次。
+  case "$CLANG_VER" in
+    clang-r596125)   AOSP_CLANG_BRANCH="main-kernel" ;;
+    clang-r584948c)  AOSP_CLANG_BRANCH="main-kernel-2026" ;;
+    clang-r547379|clang-r536225) AOSP_CLANG_BRANCH="main-kernel-2025" ;;
+    clang-r510928)   AOSP_CLANG_BRANCH="main-kernel-build-2024" ;;
+    clang-r498229b)  AOSP_CLANG_BRANCH="main-kernel-build-2023" ;;
+    clang-r450784e)  AOSP_CLANG_BRANCH="master-kernel-build-2022" ;;
+    clang-r416183b)  AOSP_CLANG_BRANCH="master-kernel-build-2021" ;;
+    *)               AOSP_CLANG_BRANCH="${AOSP_CLANG_BRANCH:-main-kernel-2025}" ;;
+  esac
+  log "  AOSP clang 分支: $AOSP_CLANG_BRANCH / $CLANG_VER"
+
+  AOSP_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+  for br in "$AOSP_CLANG_BRANCH" main-kernel main-kernel-2025 main-kernel-build-2024 master-kernel-build-2022; do
+    [ -n "$br" ] || continue
+    URL="$AOSP_BASE/+archive/refs/heads/$br/$CLANG_VER.tar.gz"
+    rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
+    log "  下载 $URL"
+    if curl -fL --retry 3 -m 1800 "$URL" -o "$WS/clang.tar.gz" 2>/dev/null; then
+      SZ=$(stat -c %s "$WS/clang.tar.gz" 2>/dev/null || echo 0)
+      log "  归档大小 ${SZ} 字节"
+      # 占位符目录的归档只有 ~165 字节，解压不出来任何东西 —— 明确报出来，
+      # 而不是让它静默地变成一个空的 clang/ 目录（见文件头「坑 2」）。
+      if [ "$SZ" -lt 100000 ]; then
+        warn "  $br/$CLANG_VER 是占位符目录（归档只有 ${SZ} 字节，里面没有工具链），换下一个分支"
+        rm -f "$WS/clang.tar.gz"
+        continue
+      fi
+      tar xzf "$WS/clang.tar.gz" -C "$CLANG_DIR" 2>/dev/null || true
+      rm -f "$WS/clang.tar.gz"
+      if [ -x "$CLANG_DIR/bin/clang" ]; then
+        echo "[assemble][OK] tar 方式获取 clang 成功（$br/$CLANG_VER）"
+        break
+      fi
+      warn "  $br/$CLANG_VER 解压后没有 bin/clang（内容: $(ls -A "$CLANG_DIR" 2>/dev/null | head -3 | tr '\n' ' ')），换下一个分支"
+    else
+      warn "  $br/$CLANG_VER 下载失败（该分支上可能没有这个目录），换下一个分支"
+    fi
+  done
 fi
 
 if [ ! -x "$CLANG_DIR/bin/clang" ]; then

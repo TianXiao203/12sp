@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 # =============================================================================
-# patch-abi-safe.sh —— 【已停用 / DEPRECATED，2026-10-24】
+# patch-abi-safe.sh —— 按【设备配置】决定是否打（2026-10-25 恢复启用）
 #
-# ⚠️ 不要再用这个脚本 ⚠️
-#   它只适用于「设备配置 POSIX_MQUEUE=n」的 5.10.260 时代（LineageOS 23.2 旧 nightly）。
-#   2026-10-24 设备 OTA 到 23.2-20261002（内核 5.10.269-gki-gdafb11eb4fa2）之后，
-#   官方配置本身【就是 POSIX_MQUEUE=y / SYSVIPC=y】，struct user_struct 里的
-#   mq_bytes 位于官方位置，ABI 基线（abi-baseline/abi-crcs.txt，4188 符号）
-#   也是按这个布局算出来的。
-#   此时再把 mq_bytes 挪进 KABI 保留槽，会改变字段顺序 → 与 ROM 布局不同
-#   → 725 个符号 CRC 变化 → vendor 模块集体拒载 → 卡米标。
-#   CI 里已加防呆检查（发现 user.h 出现 ANDROID_KABI_USE(..., mq_bytes) 直接报错）。
-#   保留本文件只为记录当时的分析过程与修复手法。
+# 什么时候要打、什么时候绝不能打，取决于设备 /proc/config.gz 里
+# CONFIG_POSIX_MQUEUE 是 n 还是 y：
+#
+#   A) 设备 POSIX_MQUEUE=n（当前情况：LineageOS 24.0 / 5.10.269-geff4b40407a1）
+#      Droidspaces 的 MUST HAVE 需要 IPC namespace，而
+#        config IPC_NS depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
+#      只能选 POSIX_MQUEUE（SYSVIPC 会给 task_struct 加 sysvsem/sysvshm，
+#      那三个成员没有任何保留槽能补，开了必卡米标）。
+#      而 POSIX_MQUEUE 会给 struct user_struct 加 mq_bytes，经 cred.user
+#      波及 task/file/socket → 725 个导出符号 CRC 变化。
+#      ⇒ 把这个成员挪进 Android GKI 早就预留的 KABI 保留槽：
+#          -    ANDROID_KABI_RESERVE(2);
+#          +    ANDROID_KABI_USE(2, unsigned long mq_bytes);
+#        include/linux/android_kabi.h 在 __GENKSYMS__ 下
+#        _ANDROID_KABI_REPLACE(_orig,_new) == _orig，所以 genksyms 读到的文本
+#        仍是 `u64 android_kabi_reserved2`（与 ROM 逐字相同）→ CRC 不变；
+#        编译器侧是 8 字节 union（unsigned long 与 u64 同尺寸同对齐）→
+#        实际布局也没变。这不是糊弄检查，正是保留槽的设计用途。
+#        该手法已在 23.2@5.10.269 上实测把 725 个失配清零。
+#
+#   B) 设备 POSIX_MQUEUE=y（2026-10-24 那版 23.2 nightly 就是这种）
+#      官方布局里 mq_bytes 就在正常位置，ABI 基线也按它算。
+#      ⇒ 绝不能打补丁，否则改字段顺序 → 725 个符号变 → 卡米标。
+#      workflow 里会自动判断并做防呆检查。
+#
+# 最终裁判永远是 ABI 预检（abi-baseline/abi-crcs.txt，由设备全部 .ko 生成）。
 #
 # -----------------------------------------------------------------------------
 # 历史说明（5.10.260 时代）：让「Docker 必需的配置」不再破坏 GKI ABI
@@ -87,10 +103,26 @@ cp -n "$USER_H" "$USER_H.orig" 2>/dev/null || true
 
 # --- 0) 先看一下 KABI 保留槽是不是真的开着（否则保留槽会消失，方案不成立）------
 KABI_ON=$( { grep -rhoE '^CONFIG_ANDROID_KABI_RESERVE=y' "$ROOT/arch/arm64/configs" 2>/dev/null || true; } | head -1 )
+# 兜底：本项目的 .config 基座是设备真实配置，那里才是最终裁决。
 if [ "$KABI_ON" != "CONFIG_ANDROID_KABI_RESERVE=y" ]; then
-  echo "[WARN] 没在 arch/arm64/configs 下找到 CONFIG_ANDROID_KABI_RESERVE=y。" 
-  echo "       若该项最终为 n，user_struct 里根本【没有】保留槽，本补丁会变成"
-  echo "       「凭空加一个成员」→ 反而破坏 ABI。请先确认该项为 y 再继续。"
+  for f in "${BASE_CONFIG_FILE:-}" \
+           "${GITHUB_WORKSPACE:-}/reference/device-config.txt" \
+           "$ROOT/../../reference/device-config.txt"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    if grep -qE '^CONFIG_ANDROID_KABI_RESERVE=y' "$f"; then
+      KABI_ON="CONFIG_ANDROID_KABI_RESERVE=y"
+      echo "[i] CONFIG_ANDROID_KABI_RESERVE=y 来自 $f"
+      break
+    fi
+  done
+fi
+if [ "$KABI_ON" != "CONFIG_ANDROID_KABI_RESERVE=y" ]; then
+  echo "[ERROR] 没找到 CONFIG_ANDROID_KABI_RESERVE=y。" >&2
+  echo "        该配置决定 user_struct 里那两个 8 字节保留槽是否存在。" >&2
+  echo "        若它为 n，保留槽会被 ANDROID_KABI_RESERVE() 展开成空，" >&2
+  echo "        本补丁就变成「凭空加一个成员」→ 反而破坏 ABI。" >&2
+  echo "        拒绝继续。（请先确认 arch/arm64/configs 或 reference/device-config.txt）" >&2
+  exit 1
 fi
 
 # --- 1) 幂等：已经打过补丁就直接退出 -----------------------------------------

@@ -670,6 +670,7 @@ jobs:
                CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
                OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld \
+               KCFLAGS=-Wno-error=strict-prototypes \
                Image -j"$(nproc)" 2>&1 \
             | tee -a "$GITHUB_WORKSPACE/build.log"
           rc=${PIPESTATUS[0]}
@@ -732,15 +733,20 @@ jobs:
           CCTXT="$(grep -m1 '^CONFIG_CC_VERSION_TEXT=' "$WS/out/common/.config" 2>/dev/null || true)"
           echo "编译器           : ${CLANGV:-<取不到>}"
           echo "                 : ${CCTXT:-<取不到>}"
-          case "$CLANGV" in
-            CONFIG_CLANG_VERSION=210000)
-              echo "::notice title=编译器一致:: clang 21 / r563880c，与设备内核相同，CFI 类型哈希可匹配" ;;
-            *)
-              echo "::error title=编译器不一致::本次=$CLANGV  设备=CONFIG_CLANG_VERSION=210000（clang 21 / r563880c）"
-              echo "::error::${CCTXT:-<取不到 CC_VERSION_TEXT>}"
-              echo "::error::clang 版本不同会让 CFI 类型哈希对不上；刷进去会【卡在开机 logo】。先别刷。"
-              echo "::error::把 clang_version 改成 clang-r563880c 重新构建。" ;;
-          esac
+          # 期望值不再写死（换 ROM 就要改一次，容易忘）：直接从设备配置基线读。
+          EXP_CV="$(grep -m1 '^CONFIG_CLANG_VERSION=' "$GITHUB_WORKSPACE/reference/device-config.txt" 2>/dev/null | cut -d= -f2- || true)"
+          EXP_CT="$(grep -m1 '^CONFIG_CC_VERSION_TEXT=' "$GITHUB_WORKSPACE/reference/device-config.txt" 2>/dev/null | cut -d= -f2- || true)"
+          echo "设备期望 clang   : CONFIG_CLANG_VERSION=${EXP_CV:-<取不到>}"
+          echo "                 : ${EXP_CT:-<取不到>}"
+          if [ -n "$EXP_CV" ] && [ "$CLANGV" = "CONFIG_CLANG_VERSION=$EXP_CV" ]; then
+            echo "::notice title=编译器一致::本次 $CLANGV 与设备内核相同，CFI 类型哈希可匹配"
+          else
+            echo "::error title=编译器不一致::本次=${CLANGV:-<取不到>}  设备=CONFIG_CLANG_VERSION=${EXP_CV:-<取不到>}"
+            echo "::error::${CCTXT:-<取不到 CC_VERSION_TEXT>}"
+            echo "::error::设备期望：${EXP_CT:-<取不到>}"
+            echo "::error::clang 版本不同会让 CFI 类型哈希对不上；刷进去会【卡在开机 logo】。先别刷。"
+            echo "::error::把 clang_version 改成与设备 CONFIG_CC_VERSION_TEXT 里 based on rXXXXXX 对应的那个仓库名（当前应为 clang-r596125）。"
+          fi
 
           if [ "$REL" = "$EXPECTED_RELEASE" ]; then
             echo "::notice title=版本串一致:: ${REL}  -> 只需刷 boot.img / AK3，ROM 里现成的 vendor 模块可直接加载"
