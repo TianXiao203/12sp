@@ -29,31 +29,34 @@ echo "[+] 使用配置文件: $CONFIG_FILE"
 echo
 
 # 期望 =y 的项
-# 注：CONFIG_POSIX_MQUEUE + CONFIG_IPC_NS 是本机设备 /proc/config.gz 实测发现
-#     缺失后补上的：设备上 SYSVIPC / POSIX_MQUEUE 都是 not set，导致
-#     IPC_NS 的依赖 (SYSVIPC || POSIX_MQUEUE) 不满足、连符号行都没有。
-#     ★ 这里选 POSIX_MQUEUE 而不是 SYSVIPC —— 后者会给 struct task_struct
-#       加 sysvsem/sysvshm 成员，改变结构体布局 → 所有相关导出符号的 CRC 变化
-#       → ROM 里预编译的 vendor 模块集体拒载 → 卡在开机 logo。见下面 FORBIDDEN_Y。
+# ★ 2026-10-24 起的重大变化：本版 ROM（LineageOS 23.2 / 内核 5.10.269）的
+#   设备真实配置里 SYSVIPC=y、POSIX_MQUEUE=y、IPC_NS=y、PID_NS=y、USER_NS=y
+#   全都是开的。所以这里的清单变成"跟随设备"，SYSVIPC 也必须 y ——
+#   少开反而会让 struct task_struct 少 sysvsem/sysvshm → ABI 崩。
+#   （旧结论"不能开 SYSVIPC"只适用于设备为 n 的 5.10.260 时代。）
+#   CGROUP_DEVICE / CGROUP_PIDS 则【永远不要求】——它们改 css_set 定长数组。
 REQUIRED_Y="
 CONFIG_CGROUPS
-CONFIG_CGROUP_DEVICE
 CONFIG_CGROUP_FREEZER
-CONFIG_CGROUP_PIDS
 CONFIG_CGROUP_SCHED
 CONFIG_CPUSETS
 CONFIG_MEMCG
 CONFIG_CGROUP_CPUACCT
 CONFIG_BLK_CGROUP
+CONFIG_CFS_BANDWIDTH
 CONFIG_NAMESPACES
 CONFIG_NET_NS
 CONFIG_PID_NS
+CONFIG_SYSVIPC
 CONFIG_POSIX_MQUEUE
 CONFIG_IPC_NS
 CONFIG_UTS_NS
 CONFIG_USER_NS
 CONFIG_VETH
 CONFIG_BRIDGE
+CONFIG_MACVLAN
+CONFIG_IP6_NF_NAT
+CONFIG_IP6_NF_TARGET_MASQUERADE
 CONFIG_OVERLAY_FS
 CONFIG_SECCOMP
 CONFIG_SECCOMP_FILTER
@@ -70,33 +73,25 @@ CONFIG_KSU
 "
 fi
 
-# docker 模式（最终交付配置）：刻意不开 CGROUP_DEVICE / CGROUP_PIDS。
-# 原因（bisect 实锤，各让 295 个导出符号 CRC 变化）：这两项会让
-# CGROUP_SUBSYS_COUNT 7→9，而 include/linux/cgroup-defs.h 里
-# struct css_set / struct cgroup 的 subsys[..] / e_cset_node[..] 是定长数组，
-# 没有任何 KABI 保留槽手段能补数组长度 → 只能放弃这两个控制器。
-# 代价：Docker 会报 "Devices cgroup controller not available."（功能仍可用）。
-if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
-  REQUIRED_Y=$(printf '%s\n' "$REQUIRED_Y" \
-               | grep -vE '^CONFIG_(CGROUP_DEVICE|CGROUP_PIDS)$')
-fi
-
 # ★ 绝对不能为 y 的项（ABI 铁律）★
 #   它们会改变【被导出符号可见的结构体布局】，让内核算出的符号 CRC 与
 #   ROM 里预编译 vendor 模块记录的期望值不一致 → 模块全部拒载 →
 #   显示驱动没加载 → 屏幕永远停在米标，且无 panic、无日志、pstore 空。
 #     CONFIG_NF_TABLES      -> include/net/net_namespace.h:145
 #                              struct net 多出 netns_nftables nft;
-#     CONFIG_SYSVIPC        -> include/linux/sched.h:973
-#                              struct task_struct 多出 sysv_sem sysvsem / sysv_shm sysvshm;
 #     CONFIG_NF_TABLES_BRIDGE / CONFIG_BRIDGE_NETFILTER -> 同族，一并回避
+#     CONFIG_CGROUP_DEVICE / CONFIG_CGROUP_PIDS
+#                              -> CGROUP_SUBSYS_COUNT 7→9，
+#                                 struct css_set / cgroup 的 subsys[..] 是定长数组
+#   注：CONFIG_SYSVIPC 已从这份名单【移除】——本版设备配置本身就是 y。
 FORBIDDEN_Y="
 CONFIG_NF_TABLES
 CONFIG_NF_TABLES_BRIDGE
-CONFIG_SYSVIPC
+CONFIG_BRIDGE_NETFILTER
 "
-# docker 交付配置里还多两项绝对不能为 y（会改 struct css_set 定长数组，见上）。
-if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
+# 交付配置里还多两项绝对不能为 y（会改 struct css_set 定长数组，见上）。
+# 唯一的例外是 FRAGMENT=cgroup 的 bisect 通道（它就是要复现那 295 个失配）。
+if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
   FORBIDDEN_Y="$FORBIDDEN_Y
 CONFIG_CGROUP_DEVICE
 CONFIG_CGROUP_PIDS

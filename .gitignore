@@ -40,3 +40,9 @@ boot_b_backup.img
 
 # ABI 基线：模块二进制很大且属 ROM 版权物，只入库抽出来的 CRC 表
 abi-baseline/*.ko
+
+# 2026-10-24：重做基线时从设备拉下来的临时素材（89MB 模块 + 打包 tar + 原始 config.gz）
+abi-baseline-*/
+*.tar
+modules-269.tar
+device-config-*.gz

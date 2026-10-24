@@ -2,24 +2,45 @@
 #
 #   KSU=on|off            on=集成 ReSukiSU（默认）
 #   FRAGMENT=all|docker|ns|userns|ipc|cgroup|none
-#                         docker = 【最终交付配置】：整份碎片 - CGROUP_DEVICE/PIDS
-#                         all    = 原样（含 ABI 危险项，只用于对照实验）
+#                         docker = 【最终交付配置】（黑名单剔除 CGROUP_DEVICE/PIDS，
+#                                  但本版碎片里本来就没有这两项）
+#                         all    = 原样使用碎片
 #                         其余    = bisect 分组，仅排查用
 #   DEBUG_INFO=on|off     默认 off（16GB runner 上 FULL LTO 会 OOM 的对策）
 #
-# bisect 结论回顾（详见 configs/docker-cgroup.fragment 开头与
-# scripts/patch-abi-safe.sh）：
-#   control（设备原版配置）        → ABI 全绿 ⇒ 流水线/编译器/基线都对
-#   D2（none）                     → 全绿     ⇒ PID_NS=y 安全、DEBUG_INFO=off 安全
-#   E2（none+KSU）                 → 全绿     ⇒ ReSukiSU 安全
-#   G（只开 USER_NS）              → 全绿     ⇒ USER_NS 安全（5.10 不 gate 结构体成员）
-#   B（只开 CGROUP_DEVICE+PIDS）   → 红 295   ⇒ struct css_set 定长数组变长
-#   H（POSIX_MQUEUE+IPC_NS+SYSCTL) → 红 725   ⇒ struct user_struct 多 mq_bytes
-#   F2（整个 ns 组）               → 红 725，且与 H 的失配集合逐个 CRC 完全相同
-#   ⇒ 攻击面只剩两处：CSS_SET（放弃两个 cgroup 控制器）
-#                     及 USER_STRUCT（用 ANDROID_KABI_USE 挪进 KABI 保留槽，已修）
+# =============================================================================
+# 2026-10-24 大改：设备 OTA 到 23.2-20261002 nightly，内核变成
+#   5.10.269-gki-gdafb11eb4fa2（commit dafb11eb4fa2，clang 20.0.0 / r547379）
 #
-# --- 最终交付：ABI 安全的 Docker 配置 ---
+# 两件事随之改变，而且都推翻了旧结论：
+#
+# 1) 配置基底改为【设备真实配置】reference/device-config.txt
+#    它自带 SYSVIPC=y / POSIX_MQUEUE=y / IPC_NS=y / PID_NS=y / USER_NS=y，
+#    所以这些项现在是"必须跟随设备"，不再是危险项（少开反而会崩）。
+#    scripts/patch-abi-safe.sh（把 mq_bytes 挪进 KABI 保留槽）已停用 ——
+#    本版 ROM 的 user_struct 就是官方布局，再挪反而改字段顺序 → 725 符号变。
+#
+# 2) ABI 基线重建：abi-baseline/abi-crcs.txt 由设备全部 390 个 .ko 生成，
+#    4188 个符号（旧基线 1613 个，CRC 逐个相同，新基线是纯超集）。
+#
+# 本版新增的 Droidspaces v7 相关特性：
+#   CONFIG_MACVLAN                   --net=macvlan
+#   CONFIG_IP6_NF_NAT                IPv6 NAT
+#   CONFIG_IP6_NF_TARGET_MASQUERADE  --net=nat 的 IPv6 出网
+#   CONFIG_CFS_BANDWIDTH             --cpus
+# 仍然拿不到的：
+#   CONFIG_CGROUP_DEVICE / CGROUP_PIDS
+#     → CGROUP_SUBSYS_COUNT 7→9 会撑大 struct css_set 的定长数组，
+#       295 个符号 CRC 必变 → vendor 模块集体拒载 → 卡米标。
+#       代价：Docker 的 devices 控制器告警、Droidspaces 的 --pids-limit 不可用。
+#       要真正拿到只能连 vendor 模块一起重编重刷。
+#
+# 历史 bisect（针对 5.10.260 那版设备，仅供参考，不要照搬）：
+#   control（设备原版配置）→ 绿 ｜ D2（无碎片）→ 绿 ｜ E2（+KSU）→ 绿
+#   G（只 USER_NS）→ 绿 ｜ B（CGROUP_DEVICE+PIDS）→ 红 295
+#   H（POSIX_MQUEUE+IPC_NS）→ 红 725（user_struct.mq_bytes）
+#
+# --- 最终交付 ---
 KSU=on
 FRAGMENT=docker
 DEBUG_INFO=off

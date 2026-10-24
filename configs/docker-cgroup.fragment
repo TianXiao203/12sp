@@ -1,171 +1,121 @@
 # =============================================================================
-# 小米 12S Pro (unicorn) + LineageOS 23.2  5.10 GKI
-# Docker / containerd 所需内核配置 + ReSukiSU
+# 小米 12S Pro (unicorn) + LineageOS 23.2  5.10.269 GKI
+# 容器（Docker / Droidspaces / chroot）所需内核配置 + ReSukiSU
 #
-# 写入位置（重要）：
-#   arch/arm64/configs/gki_defconfig   —— 即 defconfig 本体，追加到文件末尾
+# ⚠️ 2026-10-24 起，本文件已改为【增量式】：
+#    构建基底不再手工 merge gki_defconfig + 4 个碎片，而是直接使用
+#    reference/device-config.txt（= 设备 /proc/config.gz 的真实导出）。
+#    理由见 .workbuddy/memory/MEMORY.md「配置基底」一节：
+#      · 设备配置是 ABI 的唯一权威（vendor 模块就是按它编的）
+#      · 手工 merge 的产物会在一些边角项上与设备不同，而其中任何一项
+#        若 gate 了结构体成员，就会导致模块集体拒载（卡米标）
+#      · 设备配置自带 SYSVIPC=y / POSIX_MQUEUE=y / IPC_NS=y / PID_NS=y /
+#        USER_NS=y —— 所以以前那些"不能开 SYSVIPC"的结论已经过期，
+#        现在【必须】与设备一致，否则 task_struct 少两个成员反而会崩
 #
-# 为什么不能写碎片：LineageOS 官方 device 树里是
-#   TARGET_KERNEL_CONFIG := gki_defconfig vendor/waipio_GKI.config \
-#                           vendor/xiaomi_GKI.config \
-#                           vendor/$(PRODUCT_DEVICE)_GKI.config vendor/debugfs.config
-#   gki_defconfig 是 base，其余全是碎片；碎片只能"新增"，改已有值会撞上
-#   build.config.msm.common 的 "ERROR! Detected overridden config!" 直接失败。
-#   而 CONFIG_PID_NS 在 base 里是 "# CONFIG_PID_NS is not set" → 必须改本体。
+# 因此本文件只列「设备配置里没有、但我们要加」的项，
+# 以及少量需要显式钉住（防止基底切换时漂移）的项。
+#
 # =============================================================================
-#
-# ★★★ ABI 铁律（这是"刷进去永远停在米标"的根因，务必先读）★★★
+# ★★★ ABI 铁律（"刷进去永远停在米标"的根因，务必先读）★★★
 #
 #   Android GKI 的内核与 vendor 模块是【分离编译】的：ROM 里
-#   /vendor/lib/modules/*.ko 在编译时把"它需要的每个内核符号的 CRC"写进了
-#   自己的 __versions 段；内核加载模块时会比对自己算出来的 CRC，不一致就
-#   直接拒绝加载。CRC 由 genksyms 从【类型定义】算出 —— 所以：
+#   /vendor_dlkm/lib/modules/*.ko 在编译时把"它需要的每个内核符号的 CRC"
+#   写进自己的 __versions 段；内核加载模块时比对自己算出的 CRC，不一致就拒载。
+#   CRC 由 genksyms 从【类型定义】算出 ⇒ 任何改变"被导出符号可见的结构体
+#   布局"的配置项，都会让相关模块全部拒载。
 #
-#     只要某个被导出符号签名涉及的结构体布局，与官方内核不同，CRC 就变，
-#     该符号相关的模块全部拒载。
-#
-#   而模块拒载的后果是：显示驱动模块也没加载 → 内核接手屏幕失败 →
+#   模块拒载的后果：显示驱动（msm_drm）也没加载 → 内核接手屏幕失败 →
 #   【屏幕永远停在米标】，没有 panic、没有日志、pstore 空 —— 极难排查。
 #
-#   本次实测踩到的两个结构性开关（都已从本文件移除）：
-#     CONFIG_NF_TABLES=y   -> include/net/net_namespace.h:145
-#                             #if defined(CONFIG_NF_TABLES) ... struct netns_nftables nft;
-#                             struct net 多一个成员，所有含 struct net * 的导出符号 CRC 全变
-#     CONFIG_SYSVIPC=y     -> include/linux/sched.h:973
-#                             #ifdef CONFIG_SYSVIPC ... struct sysv_sem sysvsem; struct sysv_shm sysvshm;
-#                             struct task_struct 多两个成员，影响面更大
+#   实测钉死的两个结构性开关（绝不要开）：
+#     CONFIG_CGROUP_DEVICE / CONFIG_CGROUP_PIDS
+#         include/linux/cgroup-defs.h:
+#             struct css_set { ... subsys[CGROUP_SUBSYS_COUNT]; e_cset_node[CGROUP_SUBSYS_COUNT]; }
+#         CGROUP_SUBSYS_COUNT = 已开启的 cgroup 子系统数，设备上是 7
+#         （cpuset/cpu/cpuacct/io/memory/freezer/net_prio），一开这两个变 9
+#         → 定长数组变长 → css_set / cgroup 布局变 → 295 个符号 CRC 变。
+#         ★ 没有任何 KABI 保留槽手段能补"数组长度"，只能不开。
+#         代价：拿不到 devices / pids 控制器（Docker 日志里
+#         "Devices cgroup controller not available."、Droidspaces 的
+#         "--pids-limit" / "Process limit support ✗" 都是它）。
+#         要好起来只能连 vendor 模块一起重编重刷（不再是"只换 Image"）。
+#     CONFIG_NF_TABLES
+#         include/net/net_namespace.h: struct net 多一个 netns_nftables 成员。
+#         （本 ROM 的 iptables 全族是 x_tables 传统后端，够用。）
 #
-#   本次 bisect 实测（每组单独开，逐组跑 ABI 预检）——按结论分成三类：
+#   注：CONFIG_SYSVIPC 与 CONFIG_POSIX_MQUEUE 在【本版 ROM】里原本就是 y，
+#       属于"必须跟随设备"的项，不再是危险项 —— 这是 5.10.260 时代的
+#       旧结论（那时设备两者皆 n），不要照搬。
 #
-#   ◎ 实测【安全】的（0 个符号 CRC 变化）：
-#       PID_NS           —— gki_defconfig 本来就 =y，设备却是 n；实测无影响
-#       USER_NS          —— 5.10 这棵树里它不 gate 任何结构体成员
-#                           （user_struct.locked_vm 的条件是
-#                            PERF_EVENTS||BPF_SYSCALL||NET||IO_URING，早就是 y）
-#       ReSukiSU         —— 有无 KSU 的失配集合完全一致
-#       DEBUG_INFO=off   —— genksyms 只看类型，不看调试数据
-#
-#   ✗ 实测【致命】的（各让 295 / 725 个符号 CRC 变化）：
-#       CGROUP_DEVICE / CGROUP_PIDS  → 295 个
-#           include/linux/cgroup-defs.h 里
-#               struct css_set { ... subsys[CGROUP_SUBSYS_COUNT]; e_cset_node[CGROUP_SUBSYS_COUNT]; }
-#           CGROUP_SUBSYS_COUNT 由「已开启的 cgroup 子系统数」决定，
-#           设备上是 7（cpuset/cpu/cpuacct/io/memory/freezer/net_prio），
-#           一开这两个就变 9 → 定长数组变长 → css_set 布局变。
-#           ★ 没有任何 KABI 保留槽手段能补"数组长度"，所以只能不开。
-#             代价：Docker 会报 "Devices cgroup controller not available."
-#             （容器仍能跑，只是拿不到 devices 白名单与 pids 上限）
-#             要真正拿到这两个控制器，只能连 vendor 模块一起重编重刷
-#             （modules/qcom/... 那一大票，见 build.env 的 EXT_MODULES）。
-#       POSIX_MQUEUE                 → 725 个
-#           include/linux/sched/user.h 里
-#               #ifdef CONFIG_POSIX_MQUEUE
-#                   unsigned long mq_bytes;
-#               #endif
-#           user_struct 经 cred.user 被 task/file/socket 广泛引用，面极大。
-#           ★ 这个【已经救回来了】：scripts/patch-abi-safe.sh 把它挪进
-#             Android GKI 预留的 KABI 保留槽（ANDROID_KABI_USE(2, unsigned long mq_bytes)），
-#             genksyms 看到的文本与 ROM 逐字相同 → CRC 不变，实际布局也不变。
-#           ★ 为什么非用 POSIX_MQUEUE 不可：IPC_NS 的 Kconfig 是
-#               depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
-#             而 SYSVIPC 会给 struct task_struct 加 sysvsem/sysvshm（更致命），
-#             所以 IPC namespace 只能走 POSIX_MQUEUE 这条路。
-#       SYSVIPC / NF_TABLES          → 见文件开头的两个老雷（task_struct / struct net）
-#
-#   结论：最终交付配置 = 本碎片 - {CGROUP_DEVICE, CGROUP_PIDS}，
-#         即 ci/build-flags.txt 里的 FRAGMENT=docker。
-#         （scripts/filter-fragment.sh 的 docker 模式负责剔除这两个）
-#
-#   刷机前必过 scripts/check-abi-crc.py 的 ABI 预检：
-#   它会拿 ROM 模块的 CRC 与自己内核的 Module.symvers 逐一比对，不一致就报红、别刷。
-#   基线在 abi-baseline/abi-crcs.txt。
-#
+#   刷机前必过 ABI 预检：scripts/check-abi-crc.py 会把本内核的符号 CRC 与
+#   abi-baseline/abi-crcs.txt（由设备全部 390 个 .ko 生成，4188 个符号）
+#   逐一比对，不一致就报红、别刷。
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
-# 1. cgroup 基础
-#    【设备实测】CGROUP_DEVICE 与 CGROUP_PIDS 都是 "# ... is not set"
-#    （Kconfig 里 bool "Device controller" 没有 default y）。
-#    Docker 的 devices 白名单、以及模块日志里的
-#    "Devices cgroup controller not available." 都指向它们。
-#
-#    ★★★ 但实测这两个开关【会破坏 ABI】（各让 295 个导出符号 CRC 变化）★★★
-#      它们会让 CGROUP_SUBSYS_COUNT 7→9，而 struct css_set / struct cgroup 里的
-#      subsys[CGROUP_SUBSYS_COUNT] / e_cset_node[CGROUP_SUBSYS_COUNT] 是定长数组，
-#      KABI 保留槽救不了数组长度 → 开了就卡米标。
-#      ⇒ 最终交付用 FRAGMENT=docker，由 scripts/filter-fragment.sh 把这两行剔除；
-#        保留在这里只是为了能复现 bisect B 组的 295 失配。
+# 1. cgroup 基础（设备本来就是这些值，钉住防止基底漂移）
+#    ★ 这里【故意不写】 CGROUP_DEVICE / CGROUP_PIDS —— 见上面 ABI 铁律。
 # -----------------------------------------------------------------------------
 CONFIG_CGROUPS=y
-CONFIG_CGROUP_DEVICE=y
 CONFIG_CGROUP_FREEZER=y
-CONFIG_CGROUP_PIDS=y
 CONFIG_CGROUP_SCHED=y
 CONFIG_CPUSETS=y
 CONFIG_MEMCG=y
 CONFIG_CGROUP_CPUACCT=y
 CONFIG_BLK_CGROUP=y
 
+# Droidspaces 报 "CPU limit support ✗ / CONFIG_CFS_BANDWIDTH" 就是因为缺它。
+# 影响面：struct cfs_rq / struct task_group 多出限流字段（内部结构，
+# 只被调度器自身使用）。若 ABI 预检报红，第一个要怀疑的就是它。
+CONFIG_CFS_BANDWIDTH=y
+
 
 # -----------------------------------------------------------------------------
-# 2. 命名空间
-#    【设备实测】NAMESPACES=y / NET_NS=y / UTS_NS=y 本来就是开的；
-#      # CONFIG_PID_NS is not set                 -> 显式关闭（脚本改本体那一行）
-#      # CONFIG_USER_NS is not set                -> 5.10 里 default n
-#      CONFIG_IPC_NS 这一行【完全不存在】         -> 依赖未满足，见下
-#
-#    IPC namespace 的 Kconfig 是：
-#      config IPC_NS
-#          depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
-#    设备上两者都是 not set，所以 IPC_NS 连符号都不可见。
-#
-#    ★ 这里用的是 POSIX_MQUEUE，不是 SYSVIPC ★
-#      SYSVIPC 会给 struct task_struct 加 sysvsem/sysvshm 两个成员，
-#      改变结构体布局 → ABI 崩（见文件开头"ABI 铁律"）。
-#      POSIX_MQUEUE 本身也会给 struct user_struct 加 mq_bytes（725 个符号！），
-#      但那个坑【已由 scripts/patch-abi-safe.sh 修好】：mq_bytes 被挪进
-#      Android GKI 早就预留好的 KABI 保留槽（ANDROID_KABI_USE），
-#      genksyms 看到的文本与 ROM 逐字相同 → CRC 不变、布局也不变。
-#      ⇒ 所以这条路上必须【同时】应用该补丁，两者不可分开。
+# 2. 命名空间（设备 5.10.269 全部已经是 y，这里显式钉住）
+#    IPC_NS 的 Kconfig 依赖是 (SYSVIPC || POSIX_MQUEUE)，本 ROM 两者都 y。
 # -----------------------------------------------------------------------------
 CONFIG_NAMESPACES=y
 CONFIG_NET_NS=y
 CONFIG_PID_NS=y
 CONFIG_UTS_NS=y
 CONFIG_USER_NS=y
-
-# IPC namespace 的前置条件（设备上原本也是 not set）
-CONFIG_POSIX_MQUEUE=y
 CONFIG_IPC_NS=y
+# 跟随设备（★ 不是"我们要开"，是"设备本来就有"，少开反而会崩）
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
 CONFIG_POSIX_MQUEUE_SYSCTL=y
 
 
 # -----------------------------------------------------------------------------
-# 3. 网络 / 联合文件系统
-#    VETH / BRIDGE / OVERLAY_FS 已经是 =y，列出便于校验。
+# 3. 网络
+#    VETH / BRIDGE / OVERLAY_FS / TUN / FUSE_FS 设备已 y。
 #
-#    ★ 不再开启 NF_TABLES / NF_TABLES_BRIDGE / BRIDGE_NETFILTER ★
-#      NF_TABLES 会给 struct net 加成员（ABI 崩，见开头）。
-#      好消息：本内核的 xtables（iptables 传统后端）全族是 =y 内建的 ——
-#        NETFILTER_XTABLES=y  IP_NF_IPTABLES=y  IP_NF_FILTER=y
-#        IP_NF_NAT=y  IP_NF_TARGET_MASQUERADE=y  NF_CONNTRACK=y  NF_NAT=y
-#      所以 Docker 的 bridge/NAT 用 iptables-legacy 就能工作。
-#      Ubuntu chroot 里如果 iptables 默认走 nft 后端，切一下即可：
-#        update-alternatives --set iptables  /usr/sbin/iptables-legacy
-#        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
-#      （BRIDGE_NETFILTER 只在"过滤同网桥内转发流量"时才需要，
-#        容器访问外网走的是路由路径，不依赖它。）
+#    Droidspaces v7 新增要求：
+#      CONFIG_MACVLAN                    → --net=macvlan
+#      CONFIG_IP6_NF_NAT                 → IPv6 NAT 前缀
+#      CONFIG_IP6_NF_TARGET_MASQUERADE   → --net=nat 的 IPv6 出网
+#    注意 NF_NAT=y / NF_CONNTRACK=y 设备已开，所以 struct nf_conn 的
+#    nat 相关成员已经在官方布局里，开 IPv6 NAT 只是新增代码路径，
+#    理论上不动任何被导出的结构体（仍以 ABI 预检为准）。
+#
+#    ★ 仍然不开 NF_TABLES / NF_TABLES_BRIDGE / BRIDGE_NETFILTER：
+#      NF_TABLES 会给 struct net 加成员；BRIDGE_NETFILTER 同理回避。
+#      iptables 走 x_tables 传统后端即可。
 # -----------------------------------------------------------------------------
 CONFIG_VETH=y
 CONFIG_BRIDGE=y
 CONFIG_OVERLAY_FS=y
+CONFIG_MACVLAN=y
+CONFIG_IP6_NF_NAT=y
+CONFIG_IP6_NF_TARGET_MASQUERADE=y
 
 
 # -----------------------------------------------------------------------------
-# 4. 安全 / BPF
-#    SECCOMP / SECCOMP_FILTER 定义在 arch/Kconfig，default y（本来就是开的）。
-#    CGROUP_BPF / BPF_SYSCALL 已经是 =y。
+# 4. 安全 / BPF（设备已 y，钉住）
+#    CGROUP_BPF=y 是 cgroup v2 设备控制（BPF_PROG_TYPE_CGROUP_DEVICE）的前提，
+#    也正是"不开 CGROUP_DEVICE 也能做设备隔离"的依据。
 # -----------------------------------------------------------------------------
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
@@ -174,10 +124,7 @@ CONFIG_BPF_SYSCALL=y
 
 
 # -----------------------------------------------------------------------------
-# 5. ReSukiSU
-#    5.10 属于 GKI2：默认用 kprobes hook，不需要 CONFIG_KSU_MANUAL_HOOK，
-#    只要求 CONFIG_KPROBES=y（本内核已是 y）。
-#    如果刷入后管理器显示未安装，再把 TRACEPOINT 打开重编（两者不要同时开）。
+# 5. ReSukiSU（5.10 属 GKI2：走 kprobes hook，要求 CONFIG_KPROBES=y，设备已 y）
 # -----------------------------------------------------------------------------
 CONFIG_KSU=y
 CONFIG_KSU_TOOLKIT_SUPPORT=y
@@ -187,19 +134,8 @@ CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
 
 
 # -----------------------------------------------------------------------------
-# 6. 便于在手机上校验（可选但强烈建议）
-#    没有这两个，/proc/config.gz 不存在，就只能靠 /proc/cgroups 反推。
-#    （设备上本来就是 y，列在这里只是为了编译后校验。）
+# 6. 便于在手机上校验（设备已 y）
 # -----------------------------------------------------------------------------
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
-
-
-# -----------------------------------------------------------------------------
-# 7. 补齐与设备真实 .config 的差异（对齐官方构建）
-#    【设备实测】reference/device-config.txt:7485 是 CONFIG_PAGE_EXTENSION=y，
-#    但 gki_defconfig 里【没有这一行】（Kconfig 无 default y）→ 我们的合并
-#    结果是 n（Run#7 与设备 diff 的 20 项差异之一）。补回来，减少与
-#    "能启动的官方内核"的分歧面。
-# -----------------------------------------------------------------------------
 CONFIG_PAGE_EXTENSION=y

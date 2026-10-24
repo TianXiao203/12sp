@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# patch-abi-safe.sh —— 让「Docker 必需的配置」不再破坏 GKI ABI
+# patch-abi-safe.sh —— 【已停用 / DEPRECATED，2026-10-24】
+#
+# ⚠️ 不要再用这个脚本 ⚠️
+#   它只适用于「设备配置 POSIX_MQUEUE=n」的 5.10.260 时代（LineageOS 23.2 旧 nightly）。
+#   2026-10-24 设备 OTA 到 23.2-20261002（内核 5.10.269-gki-gdafb11eb4fa2）之后，
+#   官方配置本身【就是 POSIX_MQUEUE=y / SYSVIPC=y】，struct user_struct 里的
+#   mq_bytes 位于官方位置，ABI 基线（abi-baseline/abi-crcs.txt，4188 符号）
+#   也是按这个布局算出来的。
+#   此时再把 mq_bytes 挪进 KABI 保留槽，会改变字段顺序 → 与 ROM 布局不同
+#   → 725 个符号 CRC 变化 → vendor 模块集体拒载 → 卡米标。
+#   CI 里已加防呆检查（发现 user.h 出现 ANDROID_KABI_USE(..., mq_bytes) 直接报错）。
+#   保留本文件只为记录当时的分析过程与修复手法。
+#
+# -----------------------------------------------------------------------------
+# 历史说明（5.10.260 时代）：让「Docker 必需的配置」不再破坏 GKI ABI
 #
 # 背景（本次 bisect 实测结论，务必先读）：
 #   LineageOS 23.2 的设备内核配置里，下面这些开关全是【关闭】的：

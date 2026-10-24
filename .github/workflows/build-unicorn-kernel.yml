@@ -43,13 +43,14 @@ on:
       kernel_commit:
         description: '钉住内核树 commit（设备 kernel release 含 -g<sha>，必须一致）'
         required: true
-        default: 'ef362912d37b761041709638c1e571d6394e9558'
+        default: 'dafb11eb4fa234e7bedc76b746cdcfc5667023a4'
       clang_version:
-        description: '⚠️ 必须与 ROM 里 vendor 模块用的编译器一致（CFI 类型哈希由编译器决定）。设备实测 clang 21.0.0 / r563880c'
+        description: '⚠️ 必须与 ROM 里 vendor 模块用的编译器一致（5.10 用传统 CFI，跨模块 __cfi_check 的 type id 由编译器分配）。设备 20261002 nightly 实测 clang 20.0.0 / based on r547379'
         required: true
-        default: 'clang-r563880c'
+        default: 'clang-r547379'
         type: choice
         options:
+          - clang-r547379
           - clang-r563880c
           - clang-r416183b
       device:
@@ -151,8 +152,8 @@ jobs:
       # 下面统一用 `inputs.x || 默认值`：手动触发时用表单值，
       # push 自动触发时（inputs 为空）也能拿到正确默认值。
       IN_BRANCH: ${{ inputs.lineage_branch || 'lineage-23.2' }}
-      IN_COMMIT: ${{ inputs.kernel_commit || 'ef362912d37b761041709638c1e571d6394e9558' }}
-      IN_CLANG: ${{ inputs.clang_version || 'clang-r563880c' }}
+      IN_COMMIT: ${{ inputs.kernel_commit || 'dafb11eb4fa234e7bedc76b746cdcfc5667023a4' }}
+      IN_CLANG: ${{ inputs.clang_version || 'clang-r547379' }}
       IN_DEVICE: ${{ inputs.device || 'unicorn' }}
       IN_VARIANT: ${{ inputs.variant || 'gki' }}
       IN_LTO: ${{ inputs.lto || 'full' }}
@@ -164,7 +165,8 @@ jobs:
       IN_FREE_DISK: ${{ inputs.free_disk || 'false' }}
       IN_SWAP: ${{ inputs.enable_swap || 'true' }}
       # 设备实测 uname -r，用于校验 vermagic 是否一致
-      EXPECTED_RELEASE: '5.10.260-gki-gef362912d37b'
+      # 2026-10-24 设备 OTA 到 23.2-20261002-NIGHTLY 后变为 5.10.269-gki-gdafb11eb4fa2
+      EXPECTED_RELEASE: '5.10.269-gki-gdafb11eb4fa2'
 
     steps:
       - name: Checkout build kit
@@ -304,7 +306,7 @@ jobs:
         uses: actions/cache@v4
         with:
           # key 里带 commit：换了 commit 就不会复用旧树（否则版本串/vendor 模块会对不上）
-          key: sm8450-${{ inputs.lineage_branch || 'lineage-23.2' }}-${{ inputs.kernel_commit || 'ef362912d37b761041709638c1e571d6394e9558' }}-${{ inputs.clang_version || 'clang-r563880c' }}-v1
+          key: sm8450-${{ inputs.lineage_branch || 'lineage-23.2' }}-${{ inputs.kernel_commit || 'dafb11eb4fa234e7bedc76b746cdcfc5667023a4' }}-${{ inputs.clang_version || 'clang-r547379' }}-v1
           path: |
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
@@ -320,33 +322,30 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          key: sm8450-${{ inputs.lineage_branch || 'lineage-23.2' }}-${{ inputs.kernel_commit || 'ef362912d37b761041709638c1e571d6394e9558' }}-${{ inputs.clang_version || 'clang-r563880c' }}-v1
+          key: sm8450-${{ inputs.lineage_branch || 'lineage-23.2' }}-${{ inputs.kernel_commit || 'dafb11eb4fa234e7bedc76b746cdcfc5667023a4' }}-${{ inputs.clang_version || 'clang-r547379' }}-v1
           path: |
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
 
-      - name: ABI 安全补丁（user_struct.mq_bytes 挪进 KABI 保留槽）
+      - name: 确认 user_struct 保持官方布局（★ 不要再打 KABI 补丁）
         if: ${{ env.IN_MODE != 'control' }}
         run: |
-          # 为什么需要它：
-          #   Docker 的 IPC namespace 需要 CONFIG_IPC_NS，而 IPC_NS
-          #   depends on (SYSVIPC || POSIX_MQUEUE)。SYSVIPC 会给 task_struct
-          #   加 sysvsem/sysvshm（更致命），只能选 POSIX_MQUEUE；
-          #   但 POSIX_MQUEUE 会给 struct user_struct 加一个 mq_bytes 成员
-          #   → 经 cred.user 波及 task/file/socket → 725 个符号 CRC 变。
-          #   而 Android GKI 的 user_struct 本来就有两个 8 字节 KABI 保留槽，
-          #   用 ANDROID_KABI_USE 把 mq_bytes 放进保留槽后：
-          #     genksyms 看到的文本仍是 u64 android_kabi_reserved2（与 ROM 逐字相同）
-          #     → CRC 不变；实际布局也仍是 8 字节 → 布局真的没变。
+          # 2026-10-24 变更：
+          #   本版 ROM（5.10.269）的设备配置【本来就是 POSIX_MQUEUE=y】，
+          #   所以 struct user_struct 里 mq_bytes 处在官方位置，ABI 基线
+          #   （abi-baseline/abi-crcs.txt，由设备 390 个 .ko 生成）也是按这个布局算的。
+          #   而旧的 scripts/patch-abi-safe.sh 会把 mq_bytes 挪进 KABI 保留槽，
+          #   那会改变字段顺序 → 与 ROM 布局不同 → 725 个符号 CRC 变化 → 卡米标。
+          #   所以这里只做「确认没被误打补丁」的检查，不再应用补丁。
           set -e
-          bash "$GITHUB_WORKSPACE/scripts/patch-abi-safe.sh" "$WS/common" \
-            2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
-          if ! grep -qE 'ANDROID_KABI_USE\(2, *unsigned long +mq_bytes\)' \
-                "$WS/common/include/linux/sched/user.h"; then
-            echo "::error title=ABI 补丁没生效::user_struct 里没看到 ANDROID_KABI_USE(2, unsigned long mq_bytes)，编出来会与 ROM 模块不兼容（卡米标），先别刷。"
+          U="$WS/common/include/linux/sched/user.h"
+          if grep -qE 'ANDROID_KABI_USE\([0-9]+, *unsigned long +mq_bytes\)' "$U"; then
+            echo "::error title=存在过期的 ABI 补丁::user.h 里出现了 ANDROID_KABI_USE(..., unsigned long mq_bytes)。本版 ROM 不需要它，反而会改变布局，请先回退补丁。"
             exit 1
           fi
-          echo "::notice title=ABI 补丁已应用::user_struct.mq_bytes 走 android_kabi_reserved2，CRC 与 ROM 一致"
+          echo "== user.h 里 POSIX_MQUEUE 相关定义（应保持官方原样）=="
+          grep -n -B1 -A3 'CONFIG_POSIX_MQUEUE' "$U" | sed 's/^/    /' || true
+          echo "::notice title=布局检查通过::user_struct 保持官方定义（mq_bytes 在 POSIX_MQUEUE 块内），与 4188 符号基线一致"
 
       - name: 读取构建开关（ci/build-flags.txt —— push 触发时的 bisect 通道）
         run: |
@@ -398,44 +397,56 @@ jobs:
             *)          echo "RELAX_CONFIG_CHECK=1" >> "$GITHUB_ENV" ;;
           esac
 
-      - name: 写入 Docker/cgroup + ReSukiSU 配置
+      - name: 校验增量碎片（不再改写 gki_defconfig）
         if: ${{ env.IN_MODE != 'control' }}
         run: |
           set -e
-          bash "$GITHUB_WORKSPACE/scripts/apply-configs.sh" \
-               "$WS/common" \
-               "${FRAGMENT_FILE:-$GITHUB_WORKSPACE/configs/docker-cgroup.fragment}"
-
-      - name: 兜底：确保 ABI 危险项一定不在 defconfig 里
-        if: ${{ env.IN_MODE != 'control' }}
-        run: |
-          # 下面几项会改变【被导出符号可见的结构体布局】，导致 ROM 里预编译的
-          # vendor 模块集体拒载 → 卡在米标（详见 configs/docker-cgroup.fragment 开头）：
-          #   NF_TABLES        -> struct net 多一个成员（net_namespace.h:145）
-          #   SYSVIPC          -> struct task_struct 多两个成员（sched.h:973）
-          #   BRIDGE_NETFILTER -> 与 net 路径相关，一并回避
-          # 实测还有两项（bisect 已实锤，各让 295 个符号 CRC 变化）：
-          #   CGROUP_DEVICE / CGROUP_PIDS
-          #     -> CGROUP_SUBSYS_COUNT 7→9，而 struct css_set / struct cgroup 里
-          #        subsys[CGROUP_SUBSYS_COUNT] / e_cset_node[...] 是【定长数组】，
-          #        没有任何 KABI 保留槽手段能补数组长度 → 只能不开。
-          #        （代价：Docker 拿不到 devices/pids 控制器，会有那条 WARN。）
-          # 这里做一次硬兜底，防止以后有人手滑把它加回 fragment。
-          # 例外：FRAGMENT_MODE=cgroup 的 bisect 通道需要它们来复现 295 失配。
-          set -e
-          DEF="$WS/common/arch/arm64/configs/gki_defconfig"
-          KILL="CONFIG_NF_TABLES CONFIG_NF_TABLES_BRIDGE CONFIG_BRIDGE_NETFILTER CONFIG_SYSVIPC"
+          # 2026-10-24 起，配置基底改为 reference/device-config.txt（设备真实配置），
+          # 增量由 preconfig-kernel.sh 用 merge_config 叠加。
+          # 所以这里【不再】调用 apply-configs.sh —— 它改写 gki_defconfig 本体，
+          # 在新基底下根本不参与构建，改了只会误导后来人。
+          F="${FRAGMENT_FILE:-$GITHUB_WORKSPACE/configs/docker-cgroup.fragment}"
+          echo "== 增量碎片: $F =="
+          grep -E '^[[:space:]]*(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set)' "$F" | sed 's/^/    /'
+          B="$GITHUB_WORKSPACE/reference/device-config.txt"
+          echo "== 基底: $B （$(grep -c '^CONFIG_' "$B") 个 CONFIG_ 行）=="
+          # 防呆：碎片里绝不该出现这两项（会改 struct css_set 定长数组）
           if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
-            KILL="$KILL CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS"
-          fi
-          for k in $KILL; do
-            if grep -qE "^${k}=" "$DEF"; then
-              echo "[WARN] $DEF 里出现了 $k，正在移除（它会让 ABI 与 ROM 模块不兼容）"
-              sed -i "/^${k}=/d; /^# ${k} is not set/d" "$DEF"
+            if grep -qE '^CONFIG_(CGROUP_DEVICE|CGROUP_PIDS)=y' "$F"; then
+              echo "::error title=碎片含 ABI 危险项::CGROUP_DEVICE / CGROUP_PIDS 会让 CGROUP_SUBSYS_COUNT 7→9，css_set 定长数组变长 → 295 个符号 CRC 变化 → 卡米标。请从碎片里删掉。"
+              exit 1
             fi
+          fi
+          echo "[OK] 碎片检查通过"
+
+      - name: 兜底：检查基底与碎片的 ABI 危险项
+        if: ${{ env.IN_MODE != 'control' }}
+        run: |
+          # 会改变【被导出符号可见的结构体布局】、导致 vendor 模块集体拒载的项：
+          #   NF_TABLES        -> struct net 多一个 netns_nftables 成员
+          #   NF_TABLES_BRIDGE / BRIDGE_NETFILTER -> 同族，一并回避
+          #   CGROUP_DEVICE / CGROUP_PIDS -> css_set 的 subsys[CGROUP_SUBSYS_COUNT] 定长数组
+          # 注意：SYSVIPC / POSIX_MQUEUE【不再】是危险项 —— 本版设备配置本身就是 y，
+          #      少开反而会让 task_struct 少成员。这条与 5.10.260 时代的结论相反。
+          set -e
+          B="$GITHUB_WORKSPACE/reference/device-config.txt"
+          F="${FRAGMENT_FILE:-$GITHUB_WORKSPACE/configs/docker-cgroup.fragment}"
+          BAD=""
+          for k in NF_TABLES NF_TABLES_BRIDGE BRIDGE_NETFILTER; do
+            if grep -qE "^CONFIG_${k}=y" "$B" "$F"; then BAD="$BAD $k"; fi
           done
-          echo "[+] 检查完毕，当前 gki_defconfig 里这几项的状态："
-          grep -nE '^(# )?CONFIG_(NF_TABLES|NF_TABLES_BRIDGE|BRIDGE_NETFILTER|SYSVIPC|CGROUP_DEVICE|CGROUP_PIDS|POSIX_MQUEUE|IPC_NS|USER_NS|PID_NS)=' "$DEF" || echo "    （都已不在文件中，即均为 n）"
+          if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
+            for k in CGROUP_DEVICE CGROUP_PIDS; do
+              if grep -qE "^CONFIG_${k}=y" "$B" "$F"; then BAD="$BAD $k"; fi
+            done
+          fi
+          if [ -n "$BAD" ]; then
+            echo "::error title=ABI 危险项出现在基底/碎片里::$BAD —— 会让 ROM 的 vendor 模块拒载（卡米标），先修配置。"
+            exit 1
+          fi
+          echo "[+] 基底与碎片里都不含 ABI 危险项"
+          echo "== 基底里与 ABI 相关的关键项（应与设备一致）=="
+          grep -E '^(# )?CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|USER_NS|CGROUP_DEVICE|CGROUP_PIDS|CFS_BANDWIDTH|MACVLAN|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE)=' "$B" | sed 's/^/    /' || true
 
       - name: 集成 ReSukiSU
         if: ${{ env.IN_MODE != 'control' && env.KSU_ENABLED != '0' }}
@@ -453,26 +464,28 @@ jobs:
           echo 'CONFIG_KSU_SUSFS=y' >> "$DEF"
           echo "::warning::已开 CONFIG_KSU_SUSFS=y；SUSFS 还需按内核版本打 susfs4ksu 内核侧补丁，否则编译会失败。"
 
-      - name: 确认本树实际使用的 defconfig 碎片
+      - name: 确认配置基底与工具链
         if: ${{ env.IN_MODE != 'control' }}
         run: |
           set -e
-          DEF="$WS/common/arch/arm64/configs/gki_defconfig"
-          echo "== TARGET_KERNEL_CONFIG 期望的组合（gki_defconfig 是 base）=="
-          echo "   gki_defconfig"
-          echo "   vendor/waipio_GKI.config"
-          echo "   vendor/xiaomi_GKI.config"
-          echo "   vendor/${IN_DEVICE}_GKI.config"
-          echo "   vendor/debugfs.config"
-          echo "== 本树 vendor/ 下的碎片文件 =="
-          ls -1 "$WS/common/arch/arm64/configs/vendor/" 2>/dev/null || true
-          echo "== 关键配置最终状态（都应出现在 gki_defconfig 本体里）=="
-          grep -nE '^(# )?CONFIG_(CGROUP_DEVICE|CGROUP_PIDS|PID_NS|USER_NS|POSIX_MQUEUE|IPC_NS|SECCOMP_FILTER|KSU|KSU_[A-Z_]+|KPROBES|LOCALVERSION|NF_TABLES|SYSVIPC|BRIDGE_NETFILTER)=' "$DEF" || true
+          echo "== 配置基底 = reference/device-config.txt（设备 /proc/config.gz 原样导出）=="
+          echo "   内核树 vendor/ 下的碎片（仅作参考，新基底下不再合并）:"
+          ls -1 "$WS/common/arch/arm64/configs/vendor/" 2>/dev/null | sed 's/^/     /' || true
+          echo "== 新增的 unicorn_merged_defconfig（官方 5.10.269 才有的合并版）=="
+          ls -l "$WS/common/arch/arm64/configs/unicorn_merged_defconfig" 2>/dev/null || echo "     (不存在)"
+          echo "== 编译器（必须与设备 CONFIG_CC_VERSION_TEXT 对齐：clang 20 / r547379）=="
+          CLANG_BIN="$(ls -d "$WS"/prebuilts-master/clang/host/linux-x86/*/bin 2>/dev/null | head -1 || true)"
+          if [ -n "$CLANG_BIN" ]; then
+            "$CLANG_BIN/clang" --version | head -2 | sed 's/^/     /'
+            echo "     dir: $CLANG_BIN"
+          else
+            echo "     [WARN] 没找到 clang"
+          fi
           echo "== drivers/ 里的 KSU 集成痕迹 =="
-          ls -l "$WS/common/drivers/kernelsu" || true
-          grep -n kernelsu "$WS/common/drivers/Makefile" || true
+          ls -l "$WS/common/drivers/kernelsu" 2>/dev/null || true
+          grep -n kernelsu "$WS/common/drivers/Makefile" 2>/dev/null || true
 
-      - name: 预生成合并 defconfig（gki_defconfig + 4 个碎片 + LTO 碎片）
+      - name: 生成 .config（设备配置基底 + 增量碎片 + LTO 碎片）
         if: ${{ env.IN_MODE != 'control' }}
         run: |
           # 脚本自己写日志（PRECONFIG_LOG），失败时会用 ::error:: 发出注解
@@ -480,6 +493,12 @@ jobs:
           #    而 check-runs 的 annotations 是匿名可读的，这样失败原因才拿得到。
           set -uo pipefail
           export PRECONFIG_LOG="$GITHUB_WORKSPACE/build.log"
+          # BASE_CONFIG_FILE：以设备真实配置为基底（ABI 天然对齐）
+          # EXTRA_FRAGMENT  ：我们的增量（Docker/Droidspaces 新特性 + KSU）
+          export BASE_CONFIG_FILE="$GITHUB_WORKSPACE/reference/device-config.txt"
+          export EXTRA_FRAGMENT="${FRAGMENT_FILE:-$GITHUB_WORKSPACE/configs/docker-cgroup.fragment}"
+          echo "[i] BASE_CONFIG_FILE=$BASE_CONFIG_FILE"
+          echo "[i] EXTRA_FRAGMENT=$EXTRA_FRAGMENT"
           bash "$GITHUB_WORKSPACE/scripts/preconfig-kernel.sh" "$WS" "$WS/out/common" "$IN_LTO"
           rc=$?
           if [ "$rc" -ne 0 ]; then
@@ -487,6 +506,11 @@ jobs:
             exit "$rc"
           fi
           echo "[OK] .config 已生成：$(ls -l "$WS/out/common/.config")"
+          echo "== 与设备基线配置的差异（应为空，或只有我们故意加的几项）=="
+          diff <(grep -E '^(# )?CONFIG_' "$BASE_CONFIG_FILE" | sort) \
+               <(grep -E '^(# )?CONFIG_' "$WS/out/common/.config" | sort) \
+               | grep -E '^[<>]' | grep -vE 'DEBUG_INFO|GDB_SCRIPTS|RUSTC|CC_VERSION|LD_VERSION|AS_VERSION|PAHOLE' \
+               | head -80 || true
 
       - name: 对照模式：直接用设备原版 .config（不集成 KSU、不加任何碎片）
         if: ${{ env.IN_MODE == 'control' }}

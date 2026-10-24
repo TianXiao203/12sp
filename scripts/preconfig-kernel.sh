@@ -53,6 +53,9 @@ K="$WS/common"
 LOG="${PRECONFIG_LOG:-${GITHUB_WORKSPACE:-$PWD}/preconfig.log}"
 : > "$LOG"
 
+# 本脚本所在目录（overlay-config.py 等辅助脚本在同一个 scripts/ 下）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ---- 失败处理：打印上下文 + 发出可匿名读取的 ::error:: 注解 -----------------
 fail() {
   local msg="$*"
@@ -191,30 +194,72 @@ fi
 say "[+] $K/$LTOFRAG_REL"
 sed 's/^/    /' "$K/$LTOFRAG_REL"
 
-# ---- 4) 收集碎片（缺哪个就跳过哪个，并明确报出来）--------------------------
-step "3. 收集 defconfig 碎片"
-FRAGS=""
-for f in vendor/waipio_GKI.config vendor/xiaomi_GKI.config \
-         "vendor/unicorn_GKI.config" vendor/debugfs.config; do
-  if [ -f "$K/arch/arm64/configs/$f" ]; then
-    FRAGS="$FRAGS arch/arm64/configs/$f"
-    say "  [OK]   arch/arm64/configs/$f"
-  else
-    say "  [WARN] 不存在，跳过: arch/arm64/configs/$f"
-  fi
-done
-FRAGS="$FRAGS $LTOFRAG_REL"
+# ---- 4) 选择配置基底 + 收集碎片 --------------------------------------------
+step "3. 选择配置基底 / 收集碎片"
+#
+# 两种基底：
+#   A) 设备真实配置（推荐，BASE_CONFIG_FILE 指向 reference/device-config.txt）
+#      —— /proc/config.gz 的原样导出。vendor 模块就是按它编的，所以 ABI 天然对齐。
+#      它已经包含 gki_defconfig + waipio/xiaomi/unicorn/debugfs 全部内容，
+#      所以【不再合并那 4 个碎片】，只叠加我们的增量碎片 + LTO 碎片。
+#      2026-10-24 起默认走这条：新内核（5.10.269）的设备配置自带
+#      SYSVIPC=y / POSIX_MQUEUE=y / IPC_NS=y / PID_NS=y / USER_NS=y，
+#      只是「跟随设备」，手工 merge 反而容易在边角项上漂移。
+#   B) 内核树里的 gki_defconfig + 4 个 vendor 碎片（旧路径，保留用于对照/bisect）
+#
+BASE_CFG_REL="arch/arm64/configs/gki_defconfig"
+MERGE_OPTS="-m -r -y"
+USE_DEVICE_BASE=0
+if [ -n "${BASE_CONFIG_FILE:-}" ] && [ -f "${BASE_CONFIG_FILE}" ]; then
+  BASE_CFG_REL="$(cd "$(dirname "$BASE_CONFIG_FILE")" && pwd)/$(basename "$BASE_CONFIG_FILE")"
+  USE_DEVICE_BASE=1
+  say "[i] 基底 = 设备真实配置: $BASE_CFG_REL"
+  say "[i] 该文件已含全部 vendor 碎片内容，故不再合并 gki_defconfig/waipio/xiaomi/unicorn/debugfs"
+  FRAGS="$LTOFRAG_REL"
+else
+  say "[i] 基底 = 内核树 gki_defconfig + 4 个 vendor 碎片（旧路径）"
+  FRAGS=""
+  for f in vendor/waipio_GKI.config vendor/xiaomi_GKI.config \
+           "vendor/unicorn_GKI.config" vendor/debugfs.config; do
+    if [ -f "$K/arch/arm64/configs/$f" ]; then
+      FRAGS="$FRAGS arch/arm64/configs/$f"
+      say "  [OK]   arch/arm64/configs/$f"
+    else
+      say "  [WARN] 不存在，跳过: arch/arm64/configs/$f"
+    fi
+  done
+  FRAGS="$FRAGS $LTOFRAG_REL"
+fi
+# 我们的增量碎片（Docker/Droidspaces 新特性 + KSU）由调用方放进 $K 后通过
+# EXTRA_FRAGMENT 传入；没传的话就只叠加 LTO 碎片。
+if [ -n "${EXTRA_FRAGMENT:-}" ] && [ -f "${EXTRA_FRAGMENT}" ]; then
+  EXTRA_ABS="$(cd "$(dirname "$EXTRA_FRAGMENT")" && pwd)/$(basename "$EXTRA_FRAGMENT")"
+  FRAGS="$FRAGS $EXTRA_ABS"
+  say "[i] 增量碎片: $EXTRA_ABS"
+fi
 say "碎片列表: $FRAGS"
 
 # ---- 5) 合并 ---------------------------------------------------------------
-step "4. merge_config.sh（-m 只合并 / -r 提示冗余 / -y builtin 优先）"
+step "4. 生成合并 defconfig"
 MERGED_REL="arch/arm64/configs/vendor/zz-merged-unicorn_defconfig"
 : > "$K/$MERGED_REL"
-( cd "$K" && KCONFIG_CONFIG="$MERGED_REL" ./scripts/kconfig/merge_config.sh -m -r -y \
-      arch/arm64/configs/gki_defconfig $FRAGS ) 2>&1 | tee -a "$LOG"
-rc=${PIPESTATUS[0]}
-[ "$rc" -eq 0 ] || fail "merge_config.sh 退出码 $rc"
-[ -s "$K/$MERGED_REL" ] || fail "merge_config.sh 没有产出 $MERGED_REL"
+if [ "$USE_DEVICE_BASE" = "1" ]; then
+  # 设备配置是【完整 .config】（7000+ 行），只允许碎片里列出的 key 变化。
+  # 用 overlay-config.py 做精确覆盖：其余行逐字保留。
+  # （merge_config.sh 在这个场景下会把重复 key / 注释处理得不可预期，故不用它。）
+  say "[i] overlay-config.py：把碎片精确覆盖到设备配置上"
+  python3 "$SCRIPT_DIR/overlay-config.py" "$BASE_CFG_REL" "$K/$MERGED_REL" $FRAGS \
+    2>&1 | tee -a "$LOG"
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] || fail "overlay-config.py 退出码 $rc"
+else
+  say "[i] merge_config.sh $MERGE_OPTS（旧路径：gki_defconfig + vendor 碎片）"
+  ( cd "$K" && KCONFIG_CONFIG="$MERGED_REL" ./scripts/kconfig/merge_config.sh $MERGE_OPTS \
+        "$BASE_CFG_REL" $FRAGS ) 2>&1 | tee -a "$LOG"
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] || fail "merge_config.sh 退出码 $rc"
+fi
+[ -s "$K/$MERGED_REL" ] || fail "没有产出 $MERGED_REL"
 say "[+] 合并结果: $K/$MERGED_REL  ($(grep -c '^CONFIG_' "$K/$MERGED_REL") 行 CONFIG_)"
 
 # ---- 6) 放到 O= 目录并跑 olddefconfig --------------------------------------
@@ -299,13 +344,16 @@ KSU_ENABLED="${KSU_ENABLED:-1}"
 #   此时"必须为 y"的清单本就不成立，把 FAIL 降级为 WARN，好让构建跑到 ABI 预检
 #   那一步拿到结论（否则 preconfig 直接退非零，白等 20 分钟）。
 RELAX_CONFIG_CHECK="${RELAX_CONFIG_CHECK:-0}"
-REQ_Y="CGROUP_DEVICE CGROUP_PIDS PID_NS USER_NS POSIX_MQUEUE IPC_NS"
-# docker 模式（最终交付配置）刻意【不开】CGROUP_DEVICE / CGROUP_PIDS：
-#   CGROUP_SUBSYS_COUNT 7→9 会改 struct css_set / struct cgroup 的定长数组，
-#   KABI 保留槽救不了数组长度，只能不开。详见 patch-abi-safe.sh 顶部说明。
-if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
-  REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS"
-  say "[i] FRAGMENT=docker：不要求 CGROUP_DEVICE/CGROUP_PIDS（会破坏 ABI）"
+# 必须为 y 的项。
+#   ★ 与 2026-10 之前的清单不同：现在 SYSVIPC 也在这份清单里 ——
+#     本版设备配置（5.10.269）本来就是 SYSVIPC=y，task_struct 里带
+#     sysvsem/sysvshm。我们要是不开，结构体反而少两个成员 → ABI 崩。
+#     （旧结论"绝不能开 SYSVIPC"只适用于设备为 n 的 5.10.260 时代。）
+#   ★ CGROUP_DEVICE / CGROUP_PIDS 永远不在清单里（会改 css_set 定长数组），
+#     只有 FRAGMENT=cgroup 的 bisect 通道才刻意要求它们。
+REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS SYSVIPC CFS_BANDWIDTH MACVLAN"
+if [ "${FRAGMENT_MODE:-all}" = "cgroup" ]; then
+  REQ_Y="CGROUP_DEVICE CGROUP_PIDS"
 fi
 [ "$KSU_ENABLED" = "1" ] && REQ_Y="$REQ_Y KSU"
 for k in $REQ_Y; do
@@ -317,18 +365,18 @@ for k in $REQ_Y; do
     say "  [FAIL] CONFIG_$k 不是 y"; FAIL=$((FAIL+1))
   fi
 done
-# ★ ABI 铁律：这几项必须【不是 y】——
-#   NF_TABLES 会给 struct net 加成员、SYSVIPC 会给 struct task_struct 加成员，
-#   一旦开启，所有相关导出符号的 CRC 都会变，ROM 里预编译的 vendor 模块
-#   全部拒载 → 屏幕永远停在米标（无 panic、无日志）。详见 fragment 开头。
-for k in NF_TABLES NF_TABLES_BRIDGE SYSVIPC; do
+# ★ ABI 铁律：这几项必须【不是 y】
+#   NF_TABLES        -> struct net 多一个 netns_nftables 成员
+#   NF_TABLES_BRIDGE / BRIDGE_NETFILTER -> net 路径相关，一并回避
+#   （SYSVIPC 已从这份名单移除：本版设备配置本身就是 y，见上面的说明）
+for k in NF_TABLES NF_TABLES_BRIDGE BRIDGE_NETFILTER; do
   if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
     say "  [FAIL] CONFIG_$k=y —— 这是 ABI 危险项，会让 ROM 的 vendor 模块拒载（卡米标）"
     FAIL=$((FAIL+1))
   fi
 done
-# 同理（bisect 实锤各 295 个符号 CRC 变化）：docker 交付配置里必须没有这两项。
-if [ "${FRAGMENT_MODE:-all}" = "docker" ]; then
+# 同理（实测各 295 个符号 CRC 变化）：交付配置里必须没有这两项。
+if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
   for k in CGROUP_DEVICE CGROUP_PIDS; do
     if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
       say "  [FAIL] CONFIG_$k=y —— 会改 struct css_set 定长数组，ABI 与 ROM 模块不兼容"

@@ -131,18 +131,21 @@ echo "[assemble] clang 版本: $CLANG_VER"
 
 # 为什么 clang 版本必须和设备内核一致：
 #   ROM 里预装的 vendor_dlkm 模块是用【官方那套 clang】编的，而我们启用了
-#   CONFIG_CFI_CLANG=y —— CFI 的【类型哈希是编译器算出来的】，clang 版本不同
-#   哈希就不同。内核与 vendor 模块哈希对不上 → 早期间接调用触发 CFI 失败
-#   → 控制台还没起来，表现为**卡在开机 logo**（不是 panic 提示）。
-#   实测：设备内核 = clang 21.0.0 / r563880c（build 14054515），我们曾用 clang 12
-#   编出来 → 刷进去卡 logo；两个内核的 Linux version 串完全一样，只有编译器不同。
+#   CONFIG_CFI_CLANG=y —— 5.10 用的是【传统 CFI】（模块里有 .cfi_jt / __cfi_check，
+#   而不是 kCFI 的 __kcfi_typeid），跨模块调用的 type id 由编译器分配，
+#   clang 版本不同 id 分配就不同。内核与 vendor 模块对不上 → 早期间接调用
+#   CFI 失败 → 控制台还没起来，表现为**卡在开机 logo**（不是 panic 提示）。
+#   实测（2026-10-24 重新核对）：设备 23.2-20261002 nightly 的内核是
+#     CONFIG_CC_VERSION_TEXT="Android (13290119, ...) based on r547379) clang version 20.0.0"
+#   ⇒ 本版必须用 clang-r547379；之前 5.10.260 时代的 clang 21/r563880c 已不适用。
 #
 # 获取顺序（每个都校验 bin/clang 是否存在）：
 #   1. LineageOS 的 kernel-clang 仓库（老版本如 r416183b 在这里）
-#   2. bluegreensea 的 kernel-clang 镜像（已验证含 bin/clang、ld.lld 与全套 llvm 工具，
-#      且 manifest_14054515.xml 的 build 号与设备内核串完全一致）
-#   3. AOSP googlesource 的目录归档（GitHub runner 上通常可达）
-#   4. codeload 的 tar.gz（镜像仓库的归档，不依赖 git 对象历史）
+#   2. bluegreensea 的 kernel-clang 镜像（含 r563880c）
+#   3. KiTTYsh 的 host_linux-x86 镜像（★ 用 Git LFS 存二进制，需要 git lfs pull；
+#      含 r547379 —— 目前 GitHub 上唯一能直接取到 clang 20 的地方）
+#   4. AOSP googlesource 的目录归档（GitHub runner 上通常可达，~1GB）
+#   5. codeload 的 tar.gz（镜像仓库的归档，不依赖 git 对象历史）
 try_clang_repo() {
   local url="$1" br="${2:-}"
   log "尝试 clang 源: $url ${br:+(-b $br)}"
@@ -152,6 +155,21 @@ try_clang_repo() {
   else
     git clone --depth=1 "$url" "$CLANG_DIR" 2>/dev/null
   fi
+  # Git LFS 仓库：clone 下来只有指针文件（一两百字节），要再 pull 一次。
+  # 判断依据：bin/clang 存在但体积远小于真正的二进制（正常 >50MB 级别）。
+  if [ -f "$CLANG_DIR/bin/clang" ]; then
+    local sz
+    sz=$(stat -c %s "$CLANG_DIR/bin/clang" 2>/dev/null || echo 0)
+    if [ "$sz" -lt 1000000 ]; then
+      log "  bin/clang 只有 ${sz} 字节 —— 判定为 Git LFS 指针，执行 git lfs pull"
+      ( cd "$CLANG_DIR" \
+        && git lfs install --local >/dev/null 2>&1 \
+        && git lfs pull >/dev/null 2>&1 ) || \
+        warn "  git lfs pull 失败（可能没装 git-lfs）"
+      sz=$(stat -c %s "$CLANG_DIR/bin/clang" 2>/dev/null || echo 0)
+      log "  pull 后 bin/clang = ${sz} 字节"
+    fi
+  fi
   [ -x "$CLANG_DIR/bin/clang" ]
 }
 
@@ -159,6 +177,7 @@ if [ ! -x "$CLANG_DIR/bin/clang" ]; then
   CLANG_MIRRORS="
 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER
 https://github.com/bluegreensea/android_prebuilts_clang_kernel_linux-x86_$CLANG_VER
+https://github.com/KiTTYsh/android_prebuilts_clang_host_linux-x86_$CLANG_VER
 "
   for m in $CLANG_MIRRORS; do
     if try_clang_repo "$m"; then echo "[assemble][OK] clang 来自 $m"; break; fi
