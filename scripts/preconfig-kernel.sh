@@ -247,8 +247,22 @@ if [ "$USE_DEVICE_BASE" = "1" ]; then
   # 设备配置是【完整 .config】（7000+ 行），只允许碎片里列出的 key 变化。
   # 用 overlay-config.py 做精确覆盖：其余行逐字保留。
   # （merge_config.sh 在这个场景下会把重复 key / 注释处理得不可预期，故不用它。）
+  #
+  # ★ 碎片路径必须转成绝对路径：$LTOFRAG_REL 等是【相对内核树】的，
+  #   而本脚本的 cwd 是仓库根（$K 之外），相对路径会解析失败。
+  #   （Run 40107279212 就是死在这里：找不到 arch/arm64/configs/vendor/zz-lto.config）
+  OVERLAY_FRAGS=""
+  for f in $FRAGS; do
+    case "$f" in
+      /*)  OVERLAY_FRAGS="$OVERLAY_FRAGS $f" ;;
+      *)   if [ -f "$K/$f" ]; then OVERLAY_FRAGS="$OVERLAY_FRAGS $K/$f"
+           elif [ -f "$f" ]; then OVERLAY_FRAGS="$OVERLAY_FRAGS $(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+           else fail "碎片文件不存在: $f（相对 $K 也找不到）"; fi ;;
+    esac
+  done
   say "[i] overlay-config.py：把碎片精确覆盖到设备配置上"
-  python3 "$SCRIPT_DIR/overlay-config.py" "$BASE_CFG_REL" "$K/$MERGED_REL" $FRAGS \
+  say "[i] 碎片（绝对路径）: $OVERLAY_FRAGS"
+  python3 "$SCRIPT_DIR/overlay-config.py" "$BASE_CFG_REL" "$K/$MERGED_REL" $OVERLAY_FRAGS \
     2>&1 | tee -a "$LOG"
   rc=${PIPESTATUS[0]}
   [ "$rc" -eq 0 ] || fail "overlay-config.py 退出码 $rc"

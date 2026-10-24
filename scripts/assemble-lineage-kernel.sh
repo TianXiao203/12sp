@@ -117,7 +117,24 @@ fi
 # ---------------------------------------------------------------------------
 SCM_FILE="$WS/common/.scmversion"
 SHORT_SHA="$(cd "$WS/common" && git rev-parse HEAD 2>/dev/null | cut -c1-12)"
-if [ -n "$SHORT_SHA" ]; then
+# SCM_OVERRIDE：跨分支构建时用它把版本串钉到【设备实测值】。
+#   场景：源码切到 lineage-24.0（commit eff4b404…），但设备 ROM 还是 23.2，
+#   ROM 里 390 个 vendor 模块的 vermagic 写的是 -gdafb11eb4fa2。
+#   若照源码 HEAD 写，版本串差一个 sha → 模块全部拒载 → 卡米标。
+#   设 SCM_OVERRIDE=-gdafb11eb4fa2 后，内核版本串与设备逐字一致，
+#   真正的源码 commit 会记录在产物 INFO.txt（kernel_commit 字段）里。
+#   ★ 前提：ABI 预检（按设备 4188 符号基线）必须 0 失配，否则仍是卡米标。
+if [ -n "${SCM_OVERRIDE:-}" ]; then
+  case "$SCM_OVERRIDE" in
+    -g*) : ;;
+    *)   warn "SCM_OVERRIDE 必须以 -g 开头（收到 '$SCM_OVERRIDE'），已忽略" ; SCM_OVERRIDE="" ;;
+  esac
+fi
+if [ -n "${SCM_OVERRIDE:-}" ]; then
+  printf '%s' "$SCM_OVERRIDE" > "$SCM_FILE"
+  echo "[assemble][OK] 已按 SCM_OVERRIDE 冻结版本串: $(cat "$SCM_FILE")"
+  echo "[assemble][i]  源码 HEAD = $SHORT_SHA（版本串是设备实测值，非本树 sha）"
+elif [ -n "$SHORT_SHA" ]; then
   printf '%s' "-g$SHORT_SHA" > "$SCM_FILE"
   echo "[assemble][OK] 已冻结 scm 版本串: $(cat "$SCM_FILE")  ->  $SCM_FILE"
 else

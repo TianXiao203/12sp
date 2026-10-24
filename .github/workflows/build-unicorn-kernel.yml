@@ -31,12 +31,13 @@ on:
   workflow_dispatch:
     inputs:
       lineage_branch:
-        description: 'LineageOS 内核分支（已按实测设备钉为 23.2）'
+        description: 'LineageOS 内核分支（设备实测为 23.2；⚠️ lineage-24.0 分支头 09-20，比 23.2 的 10-05 还旧，且版本串需伪造才能加载）'
         required: true
         default: 'lineage-23.2'
         type: choice
         options:
           - lineage-23.2
+          - lineage-24.0
           - lineage-23.1
           - lineage-23.0
           - lineage-22.2
