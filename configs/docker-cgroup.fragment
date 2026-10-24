@@ -66,10 +66,30 @@ CONFIG_MEMCG=y
 CONFIG_CGROUP_CPUACCT=y
 CONFIG_BLK_CGROUP=y
 
-# Droidspaces 报 "CPU limit support ✗ / CONFIG_CFS_BANDWIDTH" 就是因为缺它。
-# 影响面：struct cfs_rq / struct task_group 多出限流字段（内部结构，
-# 只被调度器自身使用）。若 ABI 预检报红，第一个要怀疑的就是它。
-CONFIG_CFS_BANDWIDTH=y
+# ❌ CONFIG_CFS_BANDWIDTH —— 实测会破 ABI，不能开（2026-10-25 有实锤了）
+#
+#   本来以为它「只改调度器内部结构」，结果 ABI 预检直接抓出 23 个失配符号，
+#   全部落在 sched 子系统：
+#     runqueues / root_task_group（变量，类型分别是 struct rq / struct task_group）
+#     __task_rq_lock / activate_task / deactivate_task / resched_curr /
+#     check_preempt_curr / set_task_cpu / set_cpus_allowed_ptr / sched_setattr /
+#     sched_setscheduler(_nocheck) / sched_set_fifo / sched_set_normal /
+#     sched_show_task / set_user_nice / wake_up_process / update_rq_clock /
+#     uclamp_eff_value / task_may_not_preempt / migrate_swap / cpupri_find_fitness /
+#     pick_highest_pushable_task
+#
+#   机理（比「结构体自己变」更绕一层）：CFS_BANDWIDTH 给 kernel/sched/sched.h 的
+#   struct cfs_rq 加 throttled 相关字段、给 struct task_group 加
+#   struct cfs_bandwidth cfs_bandwidth; 而 genksyms 算 CRC 时会【递归解析
+#   嵌套类型】—— struct task_struct 里嵌着 struct sched_entity se，
+#   sched_entity 里又有 struct cfs_rq *cfs_rq，于是 task_struct 的指纹跟着变，
+#   凡是签名里带 task_struct* / rq* / task_group* 的导出符号全遭殃。
+#
+#   代价（如实说）：Droidspaces 的 --cpus / CPU 限额用不了（它会 skip）。
+#   什么时候能要：只能连 vendor 模块一起重编重刷，那就不是「只换 Image」了。
+#   ★ 不要因为「只有 23 个、数量少」就想着用 KABI 保留槽糊过去 ——
+#     数组/嵌套结构体递归是保留槽补不了的（同上文 CGROUP_DEVICE 那条）。
+# CONFIG_CFS_BANDWIDTH=y
 
 
 # -----------------------------------------------------------------------------

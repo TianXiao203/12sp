@@ -359,13 +359,13 @@ KSU_ENABLED="${KSU_ENABLED:-1}"
 #   那一步拿到结论（否则 preconfig 直接退非零，白等 20 分钟）。
 RELAX_CONFIG_CHECK="${RELAX_CONFIG_CHECK:-0}"
 # 必须为 y 的项。
-#   ★ 与 2026-10 之前的清单不同：现在 SYSVIPC 也在这份清单里 ——
-#     本版设备配置（5.10.269）本来就是 SYSVIPC=y，task_struct 里带
-#     sysvsem/sysvshm。我们要是不开，结构体反而少两个成员 → ABI 崩。
-#     （旧结论"绝不能开 SYSVIPC"只适用于设备为 n 的 5.10.260 时代。）
+#   ★ SYSVIPC【不在这里】：它必须与设备配置严格一致（动态比对，见下），
+#     写死「必须 y」或「必须 n」都会在换 ROM 时出错。
 #   ★ CGROUP_DEVICE / CGROUP_PIDS 永远不在清单里（会改 css_set 定长数组），
 #     只有 FRAGMENT=cgroup 的 bisect 通道才刻意要求它们。
-REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS CFS_BANDWIDTH MACVLAN"
+#   ★ CFS_BANDWIDTH 也不在：实测它让 23 个 sched 导出符号 CRC 变化
+#     （详见 configs/docker-cgroup.fragment 里那一段），绝不能开。
+REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS MACVLAN"
 if [ "${FRAGMENT_MODE:-all}" = "cgroup" ]; then
   REQ_Y="CGROUP_DEVICE CGROUP_PIDS"
 fi
@@ -383,7 +383,11 @@ done
 #   NF_TABLES        -> struct net 多一个 netns_nftables 成员
 #   NF_TABLES_BRIDGE / BRIDGE_NETFILTER -> net 路径相关，一并回避
 #   （SYSVIPC 已从这份名单移除：本版设备配置本身就是 y，见上面的说明）
-for k in NF_TABLES NF_TABLES_BRIDGE BRIDGE_NETFILTER; do
+# CFS_BANDWIDTH 也是实测确认的危险项：它给 struct cfs_rq / struct task_group
+# 加限流字段，而 genksyms 会递归解析嵌套类型 —— struct task_struct 里嵌着
+# struct sched_entity（含 struct cfs_rq *），于是 23 个 sched 导出符号 CRC 变
+# （run 40113421436 实测：runqueues / root_task_group / wake_up_process ...）。
+for k in NF_TABLES NF_TABLES_BRIDGE BRIDGE_NETFILTER CFS_BANDWIDTH; do
   if grep -q "^CONFIG_${k}=y$" "$OUT_ABS/.config"; then
     say "  [FAIL] CONFIG_$k=y —— 这是 ABI 危险项，会让 ROM 的 vendor 模块拒载（卡米标）"
     FAIL=$((FAIL+1))
