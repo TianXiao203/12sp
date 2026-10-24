@@ -73,8 +73,21 @@ CONFIG_CFS_BANDWIDTH=y
 
 
 # -----------------------------------------------------------------------------
-# 2. 命名空间（设备 5.10.269 全部已经是 y，这里显式钉住）
-#    IPC_NS 的 Kconfig 依赖是 (SYSVIPC || POSIX_MQUEUE)，本 ROM 两者都 y。
+# 2. 命名空间（★ 本版 24.0 官方配置里这四项全是 n，所以必须由我们打开）
+#    【2026-10-25 实测】24.0-20261023 的 /proc/config.gz：
+#        # CONFIG_SYSVIPC is not set / # CONFIG_POSIX_MQUEUE is not set
+#        # CONFIG_PID_NS is not set / # CONFIG_USER_NS is not set
+#        CONFIG_IPC_NS 连符号行都没有（依赖不满足）
+#      ⇒ /proc/self/ns/ 只有 cgroup mnt net time uts，Droidspaces 的
+#        MUST HAVE（PID/UTS/IPC namespace）直接过不了。
+#
+#    IPC_NS 的 Kconfig：depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
+#    ★ 只能选 POSIX_MQUEUE，绝不能开 SYSVIPC ★
+#      SYSVIPC 会给 struct task_struct 加 sysvsem/sysvshm → 所有相关导出符号
+#      CRC 变 → vendor 模块集体拒载 → 卡米标，且没有任何保留槽能补。
+#    POSIX_MQUEUE 的代价是 struct user_struct 多一个 mq_bytes（725 个符号），
+#    但那个坑可以用 Android GKI 预留的 KABI 保留槽接住（ANDROID_KABI_USE），
+#    CI 里的「ABI 安全补丁」步骤会按设备配置自动判断要不要打。
 # -----------------------------------------------------------------------------
 CONFIG_NAMESPACES=y
 CONFIG_NET_NS=y
@@ -82,10 +95,11 @@ CONFIG_PID_NS=y
 CONFIG_UTS_NS=y
 CONFIG_USER_NS=y
 CONFIG_IPC_NS=y
-# 跟随设备（★ 不是"我们要开"，是"设备本来就有"，少开反而会崩）
-CONFIG_SYSVIPC=y
 CONFIG_POSIX_MQUEUE=y
 CONFIG_POSIX_MQUEUE_SYSCTL=y
+# ★★ 绝对不要写 CONFIG_SYSVIPC=y ★★
+#    2026-10-24 曾为 23.2 设备"跟随"加过它（那版设备本身就是 y）；
+#    24.0 设备是 n，再打开会让 task_struct 多成员 → 725 符号变 → 卡米标。
 
 
 # -----------------------------------------------------------------------------
@@ -124,13 +138,15 @@ CONFIG_BPF_SYSCALL=y
 
 
 # -----------------------------------------------------------------------------
-# 5. ReSukiSU（5.10 属 GKI2：走 kprobes hook，要求 CONFIG_KPROBES=y，设备已 y）
+# 5. ReSukiSU —— 【已关闭】
+#    用户明确表示只需要 Droidspaces v7.0.0 的能力，不需要 root 管理方案。
+#    ci/build-flags.txt 里 KSU=off 时 workflow 会跳过源码集成，
+#    并把碎片里的 CONFIG_KSU* 行全部剔除（否则 Kconfig 会报未知符号）。
+#    以后若还需要，把 KSU=on 并取消下面三行注释即可。
 # -----------------------------------------------------------------------------
-CONFIG_KSU=y
-CONFIG_KSU_TOOLKIT_SUPPORT=y
-CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
-# CONFIG_KSU_TRACEPOINT_HOOK=y        # 可选：kprobes hook 不可用时启用
-# CONFIG_KSU_SUSFS=y                  # 可选：需要自行打 susfs4ksu 内核补丁
+# CONFIG_KSU=y
+# CONFIG_KSU_TOOLKIT_SUPPORT=y
+# CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
 
 
 # -----------------------------------------------------------------------------

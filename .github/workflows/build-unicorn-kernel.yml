@@ -48,14 +48,14 @@ on:
       scm_override:
         description: '★ 内核版本串里的 -g<sha>（.scmversion）。默认=设备实测值，用于「源码分支 ≠ 设备ROM分支」时保持 vermagic 一致；留空则用源码 HEAD 的 sha'
         required: false
-        default: '-gdafb11eb4fa2'
+        default: ''
       clang_version:
-        description: '⚠️ 必须与 ROM 里 vendor 模块用的编译器一致（5.10 用传统 CFI，跨模块 __cfi_check 的 type id 由编译器分配）。设备 20261002 nightly 实测 clang 20.0.0 / based on r547379'
+        description: '⚠️ 必须与 ROM 里 vendor 模块用的编译器一致（5.10 用传统 CFI，跨模块 __cfi_check 的 type id 由编译器分配）。设备 24.0 nightly 实测 clang 22.0.2 / based on r596125'
         required: true
-        default: 'clang-r547379'
+        default: 'clang-r596125'
         type: choice
         options:
-          - clang-r547379
+          - clang-r596125
           - clang-r563880c
           - clang-r416183b
       device:
@@ -158,7 +158,7 @@ jobs:
       # push 自动触发时（inputs 为空）也能拿到正确默认值。
       IN_BRANCH: ${{ inputs.lineage_branch || 'lineage-24.0' }}
       IN_COMMIT: ${{ inputs.kernel_commit || 'eff4b40407a1b6f1b1ab84554cbb540bcb495175' }}
-      IN_CLANG: ${{ inputs.clang_version || 'clang-r547379' }}
+      IN_CLANG: ${{ inputs.clang_version || 'clang-r596125' }}
       IN_DEVICE: ${{ inputs.device || 'unicorn' }}
       IN_VARIANT: ${{ inputs.variant || 'gki' }}
       IN_LTO: ${{ inputs.lto || 'full' }}
@@ -176,10 +176,10 @@ jobs:
       #   这里钉成设备实测值，让 vermagic 逐字一致；真正的源码 commit 仍写进
       #   产物 INFO.txt（kernel_commit 字段），不会失去可追溯性。
       #   ★ 前提：ABI 预检（按设备 4188 符号基线）必须 0 失配。
-      SCM_OVERRIDE: ${{ inputs.scm_override || '-gdafb11eb4fa2' }}
+      SCM_OVERRIDE: ${{ inputs.scm_override }}
       # 设备实测 uname -r，用于校验 vermagic 是否一致
-      # 2026-10-24 设备 OTA 到 23.2-20261002-NIGHTLY 后变为 5.10.269-gki-gdafb11eb4fa2
-      EXPECTED_RELEASE: '5.10.269-gki-gdafb11eb4fa2'
+      # 2026-10-25 设备升到 24.0-20261023-NIGHTLY（Android 17），uname -r = 5.10.269-gki-geff4b40407a1
+      EXPECTED_RELEASE: '5.10.269-gki-geff4b40407a1'
 
     steps:
       - name: Checkout build kit
@@ -319,7 +319,7 @@ jobs:
         uses: actions/cache@v4
         with:
           # key 里带 commit：换了 commit 就不会复用旧树（否则版本串/vendor 模块会对不上）
-          key: sm8450-${{ inputs.lineage_branch || 'lineage-24.0' }}-${{ inputs.kernel_commit || 'eff4b40407a1b6f1b1ab84554cbb540bcb495175' }}-${{ inputs.clang_version || 'clang-r547379' }}-v1
+          key: sm8450-${{ inputs.lineage_branch || 'lineage-24.0' }}-${{ inputs.kernel_commit || 'eff4b40407a1b6f1b1ab84554cbb540bcb495175' }}-${{ inputs.clang_version || 'clang-r596125' }}-v1
           path: |
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
@@ -335,30 +335,54 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          key: sm8450-${{ inputs.lineage_branch || 'lineage-24.0' }}-${{ inputs.kernel_commit || 'eff4b40407a1b6f1b1ab84554cbb540bcb495175' }}-${{ inputs.clang_version || 'clang-r547379' }}-v1
+          key: sm8450-${{ inputs.lineage_branch || 'lineage-24.0' }}-${{ inputs.kernel_commit || 'eff4b40407a1b6f1b1ab84554cbb540bcb495175' }}-${{ inputs.clang_version || 'clang-r596125' }}-v1
           path: |
             ${{ steps.pick_ws.outputs.ws }}/common
             ${{ steps.pick_ws.outputs.ws }}/prebuilts-master
 
-      - name: 确认 user_struct 保持官方布局（★ 不要再打 KABI 补丁）
+      - name: ABI 安全补丁（按设备配置的 POSIX_MQUEUE 状态自动决定打不打）
         if: ${{ env.IN_MODE != 'control' }}
         run: |
-          # 2026-10-24 变更：
-          #   本版 ROM（5.10.269）的设备配置【本来就是 POSIX_MQUEUE=y】，
-          #   所以 struct user_struct 里 mq_bytes 处在官方位置，ABI 基线
-          #   （abi-baseline/abi-crcs.txt，由设备 390 个 .ko 生成）也是按这个布局算的。
-          #   而旧的 scripts/patch-abi-safe.sh 会把 mq_bytes 挪进 KABI 保留槽，
-          #   那会改变字段顺序 → 与 ROM 布局不同 → 725 个符号 CRC 变化 → 卡米标。
-          #   所以这里只做「确认没被误打补丁」的检查，不再应用补丁。
+          # 这套逻辑要跟着【设备真实配置】走，两种情形完全相反：
+          #
+          #  A) 设备配置 POSIX_MQUEUE=n（当前 24.0 就是这种）
+          #     Droidspaces 必须有 IPC namespace（MUST HAVE），而
+          #       config IPC_NS depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
+          #     SYSVIPC 会给 task_struct 加 sysvsem/sysvshm（更致命），只能选 POSIX_MQUEUE。
+          #     但 POSIX_MQUEUE 会给 struct user_struct 加 mq_bytes
+          #     （经 cred.user 波及 task/file/socket → 725 个符号 CRC 变）。
+          #     → 必须用 Android GKI 预留的 KABI 保留槽接住它：
+          #       genksyms 看到的文本仍是 u64 android_kabi_reserved2（与 ROM 逐字相同）
+          #       → CRC 不变；编译器侧 8 字节 union → 实际布局也不变。
+          #
+          #  B) 设备配置 POSIX_MQUEUE=y（23.2@5.10.269 那种）
+          #     官方布局里 mq_bytes 就在正常位置，基线也按它算的。
+          #     此时【绝不能】打补丁，否则改字段顺序 → 725 符号变 → 卡米标。
+          #
+          # 基线 abi-baseline/abi-crcs.txt 由设备全部 390 个 .ko 生成（4188 符号），
+          # 是最终裁判；ABI 预检报红就不要刷。
           set -e
+          BASE="$GITHUB_WORKSPACE/reference/device-config.txt"
           U="$WS/common/include/linux/sched/user.h"
-          if grep -qE 'ANDROID_KABI_USE\([0-9]+, *unsigned long +mq_bytes\)' "$U"; then
-            echo "::error title=存在过期的 ABI 补丁::user.h 里出现了 ANDROID_KABI_USE(..., unsigned long mq_bytes)。本版 ROM 不需要它，反而会改变布局，请先回退补丁。"
-            exit 1
+          if grep -qE '^(# CONFIG_POSIX_MQUEUE is not set|CONFIG_POSIX_MQUEUE=n)' "$BASE"; then
+            echo "[i] 设备配置 POSIX_MQUEUE=n → 需要 KABI 保留槽补丁（mq_bytes 挪进 reserved2）"
+            bash "$GITHUB_WORKSPACE/scripts/patch-abi-safe.sh" "$WS/common" \
+              2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+            if ! grep -qE 'ANDROID_KABI_USE\([0-9]+, *unsigned long +mq_bytes\)' "$U"; then
+              echo "::error title=ABI 补丁没生效::user.h 里没有 ANDROID_KABI_USE(..., unsigned long mq_bytes)，编出来会 725 符号 CRC 不一致（卡米标）"
+              exit 1
+            fi
+            grep -n -B2 -A2 'mq_bytes' "$U" | sed 's/^/    /' || true
+            echo "::notice title=ABI 补丁已应用::user_struct.mq_bytes 走 android_kabi_reserved2，CRC 与 ROM 一致"
+          else
+            echo "[i] 设备配置 POSIX_MQUEUE=y → 不需要补丁，必须保持官方布局"
+            if grep -qE 'ANDROID_KABI_USE\([0-9]+, *unsigned long +mq_bytes\)' "$U"; then
+              echo "::error title=存在过期补丁::本版设备不需要 KABI 补丁，它会改变字段顺序，请先回退 user.h"
+              exit 1
+            fi
+            grep -n -B1 -A3 'CONFIG_POSIX_MQUEUE' "$U" | sed 's/^/    /' || true
+            echo "::notice title=布局检查通过::user_struct 保持官方定义"
           fi
-          echo "== user.h 里 POSIX_MQUEUE 相关定义（应保持官方原样）=="
-          grep -n -B1 -A3 'CONFIG_POSIX_MQUEUE' "$U" | sed 's/^/    /' || true
-          echo "::notice title=布局检查通过::user_struct 保持官方定义（mq_bytes 在 POSIX_MQUEUE 块内），与 4188 符号基线一致"
 
       - name: 读取构建开关（ci/build-flags.txt —— push 触发时的 bisect 通道）
         run: |

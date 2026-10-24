@@ -47,7 +47,6 @@ CONFIG_CFS_BANDWIDTH
 CONFIG_NAMESPACES
 CONFIG_NET_NS
 CONFIG_PID_NS
-CONFIG_SYSVIPC
 CONFIG_POSIX_MQUEUE
 CONFIG_IPC_NS
 CONFIG_UTS_NS
@@ -83,12 +82,14 @@ fi
 #     CONFIG_CGROUP_DEVICE / CONFIG_CGROUP_PIDS
 #                              -> CGROUP_SUBSYS_COUNT 7→9，
 #                                 struct css_set / cgroup 的 subsys[..] 是定长数组
-#   注：CONFIG_SYSVIPC 已从这份名单【移除】——本版设备配置本身就是 y。
+#   注：CONFIG_SYSVIPC 不在任何固定名单里 —— 它必须与设备配置【动态一致】，
+#   24.0 设备是 n、23.2@5.10.269 设备是 y，写死会错。
 FORBIDDEN_Y="
 CONFIG_NF_TABLES
 CONFIG_NF_TABLES_BRIDGE
 CONFIG_BRIDGE_NETFILTER
 "
+
 # 交付配置里还多两项绝对不能为 y（会改 struct css_set 定长数组，见上）。
 # 唯一的例外是 FRAGMENT=cgroup 的 bisect 通道（它就是要复现那 295 个失配）。
 if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
@@ -108,6 +109,21 @@ CONFIG_IKCONFIG_PROC
 "
 
 PASS=0; FAIL=0; WARN=0
+
+# ★ SYSVIPC：必须与设备配置一致（gate struct task_struct 成员，无补丁手段）。
+#   24.0 设备是 n，23.2@5.10.269 设备是 y —— 所以动态比对而不是写死。
+_DEVC="${BASE_CONFIG_FILE:-${GITHUB_WORKSPACE:-$PWD}/reference/device-config.txt}"
+if [ -f "$_DEVC" ]; then
+  _dv=$(grep -E '^CONFIG_SYSVIPC=' "$_DEVC" | tail -1 | cut -d= -f2); : "${_dv:=n}"
+  _ov=$(grep -E '^CONFIG_SYSVIPC=y$' "$CONFIG_FILE" >/dev/null 2>&1 && echo y || echo n)
+  if [ "$_dv" != "$_ov" ]; then
+    echo "  [FAIL] CONFIG_SYSVIPC 设备=$_dv 我们=$_ov —— 必须一致，否则 task_struct 布局不同（卡米标）"
+    FAILED=1
+  else
+    echo "  [OK]   CONFIG_SYSVIPC=$_ov（与设备一致）"
+  fi
+fi
+
 printf '%-38s %s\n' "配置项" "结果"
 printf '%-38s %s\n' "--------------------------------------" "------"
 

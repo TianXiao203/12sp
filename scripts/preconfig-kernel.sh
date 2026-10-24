@@ -365,7 +365,7 @@ RELAX_CONFIG_CHECK="${RELAX_CONFIG_CHECK:-0}"
 #     （旧结论"绝不能开 SYSVIPC"只适用于设备为 n 的 5.10.260 时代。）
 #   ★ CGROUP_DEVICE / CGROUP_PIDS 永远不在清单里（会改 css_set 定长数组），
 #     只有 FRAGMENT=cgroup 的 bisect 通道才刻意要求它们。
-REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS SYSVIPC CFS_BANDWIDTH MACVLAN"
+REQ_Y="PID_NS USER_NS POSIX_MQUEUE IPC_NS CFS_BANDWIDTH MACVLAN"
 if [ "${FRAGMENT_MODE:-all}" = "cgroup" ]; then
   REQ_Y="CGROUP_DEVICE CGROUP_PIDS"
 fi
@@ -389,6 +389,23 @@ for k in NF_TABLES NF_TABLES_BRIDGE BRIDGE_NETFILTER; do
     FAIL=$((FAIL+1))
   fi
 done
+# ★ SYSVIPC 必须与【设备配置】严格一致（不能一概而论开或关）：
+#   它 gate struct task_struct 的 sysvsem/sysvshm 两个成员，一旦与 ROM 不同，
+#   所有含 task_struct 的导出符号 CRC 全变 —— 而且没有任何 KABI 保留槽能补。
+#   2026-10-24 那版设备（23.2）本来是 y，2026-10-25 这版（24.0）是 n，
+#   所以这里动态比对，而不是写死"必须 y"或"必须 n"。
+_DEV_CALC="${BASE_CONFIG_FILE:-$GITHUB_WORKSPACE/reference/device-config.txt}"
+if [ -f "$_DEV_CALC" ]; then
+  _dv=$(grep -E '^CONFIG_SYSVIPC=' "$_DEV_CALC" | tail -1 | cut -d= -f2); : "${_dv:=n}"
+  _ov=$(grep -E '^CONFIG_SYSVIPC=' "$OUT_ABS/.config" | tail -1 | cut -d= -f2); : "${_ov:=n}"
+  if [ "$_dv" != "$_ov" ]; then
+    say "  [FAIL] CONFIG_SYSVIPC 设备=$_dv 我们=$_ov —— 必须与设备一致（它 gate task_struct 成员，无法用保留槽补救）"
+    FAIL=$((FAIL+1))
+  else
+    say "  [OK]   CONFIG_SYSVIPC=$_ov（与设备一致）"
+  fi
+fi
+
 # 同理（实测各 295 个符号 CRC 变化）：交付配置里必须没有这两项。
 if [ "${FRAGMENT_MODE:-all}" != "cgroup" ]; then
   for k in CGROUP_DEVICE CGROUP_PIDS; do

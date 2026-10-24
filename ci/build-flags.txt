@@ -40,7 +40,8 @@
 #   G（只 USER_NS）→ 绿 ｜ B（CGROUP_DEVICE+PIDS）→ 红 295
 #   H（POSIX_MQUEUE+IPC_NS）→ 红 725（user_struct.mq_bytes）
 #
-# --- 最终交付 ---
-KSU=on
+# --- 最终交付（2026-10-25：设备已升 LineageOS 24.0 / Android 17）---
+# KSU=off：用户明确只要 Droidspaces 支持，不需要 ReSukiSU。
+KSU=off
 FRAGMENT=docker
 DEBUG_INFO=off

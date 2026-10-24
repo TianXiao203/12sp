@@ -1937,7 +1937,7 @@ ipa3_conn_wigig_rx_pipe_i	0x5dc8179c	ipa_clientsm.ko
 ipa3_connect_mhi_pipe	0x649966df	ipa_clientsm.ko
 ipa3_connect_wdi_pipe	0x9f6f06ed	ipa_clientsm.ko
 ipa3_create_wdi_mapping	0xe523d4f1	ipa_clientsm.ko
-ipa3_ctx	0xc0bb39e5	ipa_clientsm.ko
+ipa3_ctx	0xd10064e6	ipa_clientsm.ko
 ipa3_dec_client_disable_clks	0xab40656a	ipa_clientsm.ko
 ipa3_del_hdr	0xa3c5262f	ipa_clientsm.ko,rndisipam.ko
 ipa3_deregister_client_callback	0x526892c5	ipa_clientsm.ko
@@ -2356,7 +2356,7 @@ memchr	0xa07a37f0	msm-cvp.ko,msm-eva.ko,msm_video.ko
 memcmp	0x449ad0a7	cfg80211.ko,qca_cld3_qca6490.ko,qca_cld3_qca6750.ko
 memcpy	0x4829a47e	adsp_loader_dlkm.ko,altmode-glink.ko,arm_smmu.ko
 memdup_user	0x9291cd3b	audio_pkt_dlkm.ko,camera.ko,glink_pkt.ko
-memmove	0x5a9f1d63	asix.ko,frpc-adsprpc.ko,mac80211.ko
+memmove	0x5a9f1d63	asix.ko,frpc-adsprpc.ko,lpass_cdc_rx_macro_dlkm.ko
 memory_read_from_buffer	0x65e0d6d7	qcom_ramdump.ko,qti_battery_debug.ko
 memparse	0x27864d57	msm_drm.ko,zram.ko
 mempool_alloc	0xc3762aec	cnss_prealloc.ko,msm_kgsl.ko
