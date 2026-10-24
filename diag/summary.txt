@@ -1,0 +1,54 @@
+run_id=40113421436  attempt=1
+sha=028a5bb6ca1f1eeb8c7a46512dcdd396a1e67f4d
+ws=/mnt/wbkernel/kp
+
+== df -h ==
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       146G   98G   48G  68% /
+tmpfs           7.9G  172K  7.9G   1% /dev/shm
+tmpfs           3.2G  1.0M  3.2G   1% /run
+tmpfs           5.0M     0  5.0M   0% /run/lock
+efivarfs        128M   34K  128M   1% /sys/firmware/efi/efivars
+/dev/sda15      105M  6.1M   99M   6% /boot/efi
+tmpfs           1.6G   12K  1.6G   1% /run/user/1001
+
+== free -h ==
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       565Mi        13Gi        32Mi       1.2Gi        14Gi
+Swap:           34Gi       237Mi        34Gi
+
+== kernel.release ==
+5.10.269-gki-geff4b40407a1
+
+== .scmversion ==
+-geff4b40407a1
+== upload/ ==
+total 64940
+drwxr-xr-x  2 runner runner     4096 Oct 24 17:15 .
+drwxr-xr-x 17 runner runner     4096 Oct 24 17:15 ..
+-rwxr-xr-x  1 runner runner 42205268 Oct 24 17:15 Image
+-rw-r--r--  1 runner runner 22184974 Oct 24 17:15 anykernel3-unicorn.zip
+-rw-r--r--  1 runner runner   172599 Oct 24 17:15 build.log
+-rw-r--r--  1 runner runner   819208 Oct 24 17:15 kernel.Module.symvers
+-rw-r--r--  1 runner runner   211103 Oct 24 17:15 kernel.config.txt
+-rw-r--r--  1 runner runner   879562 Oct 24 17:15 kernel.vmlinux.symvers
+
+== AnyKernel3 工作目录 ==
+total 41284
+drwxr-xr-x  7 runner runner     4096 Oct 24 17:15 .
+drwxr-xr-x 17 runner runner     4096 Oct 24 17:15 ..
+drwxr-xr-x  7 runner runner     4096 Oct 24 17:15 .git
+drwxr-xr-x  2 runner runner     4096 Oct 24 17:15 .github
+-rwxr-xr-x  1 runner runner 42205268 Oct 24 17:15 Image
+-rw-r--r--  1 runner runner    11630 Oct 24 17:15 LICENSE
+drwxr-xr-x  3 runner runner     4096 Oct 24 17:15 META-INF
+-rw-r--r--  1 runner runner    16507 Oct 24 17:15 README.md
+-rw-r--r--  1 runner runner     2675 Oct 24 17:15 anykernel.sh
+drwxr-xr-x  2 runner runner     4096 Oct 24 17:15 patch
+drwxr-xr-x  2 runner runner     4096 Oct 24 17:15 tools
+
+== 仓库自带文件 ==
+total 12
+drwxr-xr-x  2 runner runner 4096 Oct 24 16:50 .
+drwxr-xr-x 17 runner runner 4096 Oct 24 17:15 ..
+-rw-r--r--  1 runner runner 2675 Oct 24 16:50 anykernel.sh
