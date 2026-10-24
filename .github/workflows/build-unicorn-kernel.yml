@@ -170,12 +170,10 @@ jobs:
       IN_FREE_DISK: ${{ inputs.free_disk || 'false' }}
       IN_SWAP: ${{ inputs.enable_swap || 'true' }}
       # ★ 版本串里的 -g<sha>：
-      #   源码切到 lineage-24.0（HEAD eff4b404，09-20），若照 HEAD 写 .scmversion
-      #   会得到 5.10.269-gki-geff4b40407a1，而设备 ROM 里 390 个 vendor 模块的
-      #   vermagic 记录的是 -gdafb11eb4fa2 → 版本串不一致 → 模块全部拒载（卡米标）。
-      #   这里钉成设备实测值，让 vermagic 逐字一致；真正的源码 commit 仍写进
-      #   产物 INFO.txt（kernel_commit 字段），不会失去可追溯性。
-      #   ★ 前提：ABI 预检（按设备 4188 符号基线）必须 0 失配。
+      #   设备已升 LineageOS 24.0，uname -r = 5.10.269-gki-geff4b40407a1，
+      #   正好等于 lineage-24.0 分支头 eff4b404 —— 所以用真实 HEAD 即可，
+      #   SCM_OVERRIDE 留空（只有在「源码分支 ≠ ROM 分支」时才需要伪造，
+      #   而且必须同时满足 ABI 预检 0 失配）。
       SCM_OVERRIDE: ${{ inputs.scm_override }}
       # 设备实测 uname -r，用于校验 vermagic 是否一致
       # 2026-10-25 设备升到 24.0-20261023-NIGHTLY（Android 17），uname -r = 5.10.269-gki-geff4b40407a1
@@ -283,20 +281,41 @@ jobs:
           fi
           echo "== 清理后 =="; df -h / 2>/dev/null || true
 
-          # swap 只是内存兜底；GitHub runner 上 swapon 有时会被拒，失败也必须继续
+          # ★ swap 是【必需】的，不是优化：FULL LTO 链接 vmlinux.o 的峰值内存
+          #   远超 16GB runner。实测 run 40111314558（clang 22 / r596125）在
+          #   编译约 17 分钟处整轮 exit 143，而且连 if: always() 的诊断步骤都
+          #   被跳过 —— 这是 runner 进程被外部杀死的特征，也就是 OOM。
+          #   clang 20 时代 8G 勉强够；clang 22（带 MLGO/BOLT）不够了。
+          #   /mnt 有 ~86GB，其中源码 ~10GB、FULL LTO 的 out 目录 ~20GB，
+          #   所以 swap 取 32G：16G RAM + 32G swap = 48G 虚拟内存，够 FULL LTO
+          #   单线程链接（峰值约 30GB），又不会把 /mnt 撑满。
           if [ "$IN_SWAP" = "true" ]; then
             SWDIR="/mnt"
-            [ -w "$SWDIR" ] || SWDIR="/"
-            if [ ! -f "$SWDIR/swapfile" ]; then
-              sudo fallocate -l 8G "$SWDIR/swapfile" 2>/dev/null \
-                || sudo dd if=/dev/zero of="$SWDIR/swapfile" bs=1M count=8192 2>/dev/null \
-                || echo "[WARN] 创建 swapfile 失败，忽略"
+            [ -w "$SWDIR" ] || SWDIR="/tmp"
+            SW_FILE="$SWDIR/swapfile"
+            sudo swapoff "$SW_FILE" 2>/dev/null || true
+            sudo rm -f "$SW_FILE" 2>/dev/null || true
+            AVAIL_MB=$(df -Pm "$SWDIR" 2>/dev/null | awk 'NR==2{print $4}')
+            echo "[i] $SWDIR 可用 ${AVAIL_MB:-?} MB"
+            SWAP_MB=32768
+            if [ -n "$AVAIL_MB" ] && [ "$AVAIL_MB" -lt 45000 ]; then
+              SWAP_MB=$(( AVAIL_MB - 16384 ))
+              [ "$SWAP_MB" -lt 8192 ] && SWAP_MB=8192
             fi
-            sudo chmod 600 "$SWDIR/swapfile" 2>/dev/null || true
-            sudo mkswap "$SWDIR/swapfile" >/dev/null 2>&1 || echo "[WARN] mkswap 失败，忽略"
-            sudo swapon "$SWDIR/swapfile" 2>&1 || echo "[WARN] swapon 被拒，忽略"
+            echo "[i] 创建 ${SWAP_MB} MB swapfile: $SW_FILE"
+            sudo fallocate -l "${SWAP_MB}M" "$SW_FILE" 2>/dev/null \
+              || sudo dd if=/dev/zero of="$SW_FILE" bs=1M count="$SWAP_MB" status=none 2>/dev/null \
+              || echo "[WARN] 创建 swapfile 失败"
+            sudo chmod 600 "$SW_FILE" 2>/dev/null || true
+            sudo mkswap "$SW_FILE" >/dev/null 2>&1 || echo "[WARN] mkswap 失败"
+            sudo swapon "$SW_FILE" 2>&1 || echo "[WARN] swapon 被拒"
           fi
           free -h 2>/dev/null || true
+          SW_TOTAL=$(awk '/^Swap:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+          echo "[i] Swap 总量: ${SW_TOTAL} kB"
+          if [ "$IN_SWAP" = "true" ] && [ "${SW_TOTAL:-0}" -lt 2000000 ]; then
+            echo "::warning title=swap 未生效::Swap 总量只有 ${SW_TOTAL} kB，FULL LTO 链接很可能 OOM（整轮 exit 143、诊断步骤全被跳过），失败时先怀疑这里。"
+          fi
           echo "[OK] 准备步骤结束"
 
       - name: 安装构建依赖
@@ -662,6 +681,8 @@ jobs:
             echo "[i] LTO=thin：不注入 --threads（避免把 ThinLTO 也限成单线程）"
           fi
 
+          echo "== 内存/swap 现状（OOM 排查用）=="
+          free -h || true
           echo "== 开始编译 Image（预计 20~90 分钟；FULL LTO 单线程链接会显著变慢）=="
           # 暂时关掉 -e：要把 make 的真实退出码抓出来并转成 ::error:: 注解，
           # 否则 `make | tee` 一旦失败就直接跳出，什么都看不到。
@@ -671,7 +692,7 @@ jobs:
                OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld \
                KCFLAGS=-Wno-error=strict-prototypes \
-               Image -j"$(nproc)" 2>&1 \
+               Image -j"${JOBS:-3}" 2>&1 \
             | tee -a "$GITHUB_WORKSPACE/build.log"
           rc=${PIPESTATUS[0]}
           set -e
