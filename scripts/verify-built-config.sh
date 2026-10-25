@@ -56,6 +56,7 @@ CONFIG_MACVLAN
 CONFIG_IP6_NF_NAT
 CONFIG_IP6_NF_TARGET_MASQUERADE
 CONFIG_OVERLAY_FS
+CONFIG_DEVTMPFS
 CONFIG_SECCOMP
 CONFIG_SECCOMP_FILTER
 CONFIG_CGROUP_BPF
@@ -88,6 +89,13 @@ CONFIG_NF_TABLES
 CONFIG_NF_TABLES_BRIDGE
 CONFIG_BRIDGE_NETFILTER
 CONFIG_CFS_BANDWIDTH
+"
+# CONFIG_DEVTMPFS_MOUNT 不在 ABI 名单里（它不破 ABI），但一样"开了就开不了机"：
+#   =y 时内核会在 prepare_namespace 阶段把 devtmpfs 挂到 /dev，
+#   把 Android 由 init(tmpfs) + ueventd 管理的 /dev 顶掉。
+# 放在这里是为了享受同一套硬失败检查；下面的标题已改成「ABI / 启动」。
+FORBIDDEN_Y="$FORBIDDEN_Y
+CONFIG_DEVTMPFS_MOUNT
 "
 
 # 交付配置里还多两项绝对不能为 y（会改 struct css_set 定长数组，见上）。
@@ -144,7 +152,7 @@ for k in $REQUIRED_Y; do
 done
 
 echo
-echo "ABI 铁律检查（这几项一旦为 y，ROM 里预编译的 vendor 模块会全部拒载 -> 卡米标）："
+echo "ABI / 启动 铁律检查（这些项一旦为 y，不是 vendor 模块全拒载(卡米标)，就是直接开不了机）："
 for k in $FORBIDDEN_Y; do
   if grep -q "^${k}=y$" "$CONFIG_FILE"; then
     printf '%-38s %s\n' "$k" "FAIL 竟然是 y —— ABI 会被破坏，先别刷！"

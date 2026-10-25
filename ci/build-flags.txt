@@ -27,7 +27,12 @@
 #   CONFIG_MACVLAN                   --net=macvlan
 #   CONFIG_IP6_NF_NAT                IPv6 NAT
 #   CONFIG_IP6_NF_TARGET_MASQUERADE  --net=nat 的 IPv6 出网
-#   CONFIG_CFS_BANDWIDTH             --cpus
+#   CONFIG_DEVTMPFS                  「硬件访问模式」前提（23.2 设备原本就有，
+#                                    24.0 官方配置关了 → 2026-10-25 补回，
+#                                    ★ DEVTMPFS_MOUNT 必须保持 n ★）
+# 曾经加过又拿掉的：
+#   CONFIG_CFS_BANDWIDTH             --cpus —— 实测让 23 个 sched 符号 CRC 变
+#                                    （task_struct→sched_entity→cfs_rq 递归解析）
 # 仍然拿不到的：
 #   CONFIG_CGROUP_DEVICE / CGROUP_PIDS
 #     → CGROUP_SUBSYS_COUNT 7→9 会撑大 struct css_set 的定长数组，

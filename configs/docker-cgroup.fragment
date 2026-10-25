@@ -158,7 +158,38 @@ CONFIG_BPF_SYSCALL=y
 
 
 # -----------------------------------------------------------------------------
-# 5. ReSukiSU —— 【已关闭】
+# 5. devtmpfs —— Droidspaces「硬件访问模式」的前提（2026-10-25 补）
+#
+#   现象（Droidspaces v7.0.0 要求检查）：
+#       [RECOMMENDED] devtmpfs support  [✗]
+#       Required for hardware access mode; tmpfs fallback used otherwise
+#   原因：LineageOS 23.2 的设备配置是 CONFIG_DEVTMPFS=y（所以那时硬件访问可用），
+#         24.0 跟着 GKI 关掉了 → 现在是 # CONFIG_DEVTMPFS is not set。
+#         这是"官方配置随版本漂移"，不是我们之前漏了什么。
+#
+#   为什么【可以开】（不是 ABI 危险项，已逐条核对源码）：
+#     a) include/linux/device.h 里随开关变化的只有 devtmpfs_mount() 的【声明】，
+#        #ifdef 两个分支的签名完全相同（int devtmpfs_mount(void)），
+#        genksyms 是按类型算 CRC 的 → 一个符号都不动。
+#     b) drivers/base/devtmpfs.c 里没有任何 EXPORT_SYMBOL*，不会新增导出符号。
+#     c) 不碰 struct device / struct super_block / struct file_system_type
+#        等任何被导出的结构体。
+#   仍以 CI 的 ABI 预检为准：0 失配才刷机。
+#
+#   ★★ CONFIG_DEVTMPFS_MOUNT 必须保持 n ★★
+#     =y 时 devtmpfs_mount() 会在 prepare_namespace 阶段把 devtmpfs 挂到 /dev，
+#     而 Android 的 /dev 是 init 挂的 tmpfs + ueventd 填节点 —— 被抢占会直接起不来。
+#     不影响容器用：5.10 的 devtmpfs_init() 与 mount_dev 无关，总会跑起
+#     kdevtmpfs 线程建全量节点；public_dev_mount() 返回的是【同一个内核实例】
+#     的 s_root ⇒ 容器里 mount -t devtmpfs 照样拿到完整设备节点树。
+#     （以后 24.0 的正式配置若又把 DEVTMPFS 打开，这里会与设备一致，无害。）
+# -----------------------------------------------------------------------------
+CONFIG_DEVTMPFS=y
+# CONFIG_DEVTMPFS_MOUNT is not set
+
+
+# -----------------------------------------------------------------------------
+# 6. ReSukiSU —— 【已关闭】
 #    用户明确表示只需要 Droidspaces v7.0.0 的能力，不需要 root 管理方案。
 #    ci/build-flags.txt 里 KSU=off 时 workflow 会跳过源码集成，
 #    并把碎片里的 CONFIG_KSU* 行全部剔除（否则 Kconfig 会报未知符号）。
@@ -170,7 +201,7 @@ CONFIG_BPF_SYSCALL=y
 
 
 # -----------------------------------------------------------------------------
-# 6. 便于在手机上校验（设备已 y）
+# 7. 便于在手机上校验（设备已 y）
 # -----------------------------------------------------------------------------
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
