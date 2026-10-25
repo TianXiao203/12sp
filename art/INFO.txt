@@ -1,0 +1,10 @@
+run_id=40155845818
+sha=378828a30c00f4f0763b31c408aef8eb32384704
+branch=lineage-24.0
+kernel_commit=eff4b40407a1b6f1b1ab84554cbb540bcb495175
+clang_version=clang-r596125
+lto=full
+kernel.release=5.10.269-gki-geff4b40407a1
+scmversion=-geff4b40407a1
+zip_bytes=22242293
+zip_sha256=f489b6279fb030e67a8c97a5cb689f34b79677a7d2bbbc1236c3fa01dadfc272
