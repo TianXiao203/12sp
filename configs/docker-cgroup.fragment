@@ -145,6 +145,41 @@ CONFIG_MACVLAN=y
 CONFIG_IP6_NF_NAT=y
 CONFIG_IP6_NF_TARGET_MASQUERADE=y
 
+# --- 3b. netfilter xt 扩展：23.2 有、24.0 被关（Docker bridge 起不来的真凶）---
+#
+# 【2026-10-25 实测】docker 报：
+#   failed to register "bridge" driver: failed to add jump rules to ipv4 NAT table:
+#   iptables --wait -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+#   Warning: Extension addrtype revision 0 not supported, missing kernel module?
+#   iptables: No chain/target/match by that name.
+#   → dockerd 直接 exit 1，systemd 反复重启后被 Start request repeated too quickly 掐死。
+#
+# 原因：`CONFIG_NETFILTER_XT_MATCH_ADDRTYPE` 在 23.2 设备配置里是 =y，
+#       24.0 关掉了（=n）。Docker 的 bridge 驱动给 nat-PREROUTING 加的第一条
+#       跳转规则就必须用 -m addrtype，缺了它整个网络控制器初始化失败。
+#       ★ 这和 DEVTMPFS 是同一类：官方配置随版本漂移，不是我们配错了。
+#
+# 为什么不能靠 insmod：Android 侧 /vendor_dlkm 里没有 xt_addrtype.ko（395 个模块里没有），
+# chroot 里也没有 /lib/modules —— 这些 xt 扩展必须编进内核（=y）。
+#
+# ABI 安全性：xt match/target 都是自注册的 `struct xt_match/xt_target` 实例，
+# 不改任何被导出的结构体布局，也没有 gate `struct net` 的成员
+# （会 gate 的是 NF_TABLES，我们仍然不开）。仍以 CI 的 ABI 预检为准。
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+
+# 同批被 24.0 关掉、但 23.2 上跑过（1Panel / 防火墙脚本 / ipset 规则会用到），
+# 一并按 23.2 的原样补回，免得下次再"某个功能突然不工作"：
+CONFIG_NETFILTER_XT_MATCH_RECENT=y
+CONFIG_NETFILTER_XT_SET=y
+CONFIG_IP_SET=y
+CONFIG_IP_SET_HASH_IP=y
+CONFIG_IP_SET_HASH_NET=y
+CONFIG_NETFILTER_XT_TARGET_LOG=y
+CONFIG_NF_LOG_COMMON=y
+CONFIG_NF_LOG_IPV4=y
+CONFIG_NF_LOG_IPV6=y
+CONFIG_TMPFS_XATTR=y
+
 
 # -----------------------------------------------------------------------------
 # 4. 安全 / BPF（设备已 y，钉住）
